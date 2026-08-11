@@ -2,6 +2,7 @@ package watch
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -147,3 +148,26 @@ type QueueResponse struct {
 	Processing []QueueTaskItem `json:"processing"`
 	Processed  []QueueTaskItem `json:"processed"`
 }
+
+// Slugify converts arbitrary strings into clean alphanumeric slug identifiers.
+func Slugify(s string) string {
+	s = strings.ToLower(s)
+	s = strings.ReplaceAll(s, " ", "-")
+	var res strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			res.WriteRune(r)
+		}
+	}
+	return res.String()
+}
+
+func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
+	if val := os.Getenv(key); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			return d
+		}
+	}
+	return defaultValue
+}
+
