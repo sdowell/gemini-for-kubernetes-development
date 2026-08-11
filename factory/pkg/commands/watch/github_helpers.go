@@ -180,6 +180,9 @@ func getMissingLabelsForPR(prLabels []*githubv39.Label, refIssues []*githubv39.I
 }
 
 func hasLinkedPR(ctx context.Context, client *githubv39.Client, owner, repo string, issueNum int) (bool, error) {
+	if client == nil {
+		return false, nil
+	}
 	// 1. Try timeline check (quick and standard)
 	timeline, _, err := client.Issues.ListIssueTimeline(ctx, owner, repo, issueNum, nil)
 	if err == nil {

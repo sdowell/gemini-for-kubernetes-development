@@ -88,6 +88,9 @@ func resolveSandboxName(ctx context.Context, kubeClient *clients.KubernetesClien
 }
 
 func isSandboxTaskRunning(ctx context.Context, kubeClient *clients.KubernetesClient, namespace, name string) (bool, error) {
+	if kubeClient == nil {
+		return false, nil
+	}
 	unstructObj, err := kubeClient.DynamicClient.Resource(k8s.SandboxGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
@@ -242,6 +245,9 @@ func isSandboxTaskCompleted(ctx context.Context, kubeClient *clients.KubernetesC
 }
 
 func countRunningSandboxTasks(ctx context.Context, kubeClient *clients.KubernetesClient, namespace string) (int, error) {
+	if kubeClient == nil {
+		return 0, nil
+	}
 	list, err := kubeClient.DynamicClient.Resource(k8s.SandboxGVR).Namespace(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return 0, err
