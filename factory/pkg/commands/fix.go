@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/clients"
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/config"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/envd"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/github"
@@ -132,7 +133,7 @@ func NewFixCommand(ctx context.Context) *cobra.Command {
 	return cmd
 }
 
-func runFix(ctx context.Context, targetURL, prompt, name string, noPR, watch bool, pollInterval time.Duration, watchTimeout time.Duration, ephemeralStorage string, secrets []factorysandbox.SecretMount) error {
+func runFix(ctx context.Context, targetURL, prompt, name string, noPR, watchPR bool, pollInterval time.Duration, watchTimeout time.Duration, ephemeralStorage string, secrets []factorysandbox.SecretMount) error {
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		klog.Warningf("Failed to load factory config: %v", err)
@@ -220,9 +221,9 @@ func runFix(ctx context.Context, targetURL, prompt, name string, noPR, watch boo
 		}
 
 		// Intercept and run as workflow if a workflow path is referenced in the issue body
-		workflowPath := findWorkflowPath(issueBody)
+		workflowPath := watch.FindWorkflowPath(issueBody)
 		if workflowPath != "" {
-			if isWorkflowDefinition(ctx, ghClient, owner, repo, workflowPath) {
+			if watch.IsWorkflowDefinition(ctx, ghClient, owner, repo, workflowPath) {
 				fmt.Printf("Detected workflow definition '%s' referenced in issue #%d. Forwarding to workflow execution...\n", workflowPath, issueNum)
 				agentFlags := AgentFlags{
 					URL:       targetURL,
@@ -379,11 +380,11 @@ func runFix(ctx context.Context, targetURL, prompt, name string, noPR, watch boo
 			}
 		}
 
-		if watch {
+		if watchPR {
 			fmt.Printf("\nStarting PR watch for %s...\n", prURL)
 			return runPRWatch(ctx, prURL, pollInterval, false, true, watchTimeout, ephemeralStorage, secrets)
 		}
-	} else if watch {
+	} else if watchPR {
 		fmt.Println("\nWarning: --watch was specified but could not determine PR URL from task output.")
 	}
 

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/config"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/geminitokens"
 	factorysandbox "github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/sandbox"
@@ -121,7 +122,7 @@ coding tasks without local side effects or host dependencies.`,
 	prCmd.GroupID = "workflows"
 	cmd.AddCommand(prCmd)
 
-	watchCmd := NewWatchCommand(ctx)
+	watchCmd := watch.NewWatchCommand(ctx, resolveWatchRootOptions)
 	watchCmd.GroupID = "workflows"
 	cmd.AddCommand(watchCmd)
 
@@ -313,4 +314,23 @@ func ToSandboxEnvs(envs []config.EnvVar) []factorysandbox.EnvVar {
 		}
 	}
 	return res
+}
+
+func resolveWatchRootOptions(cmd *cobra.Command) (*watch.RootOptions, error) {
+	_, err := ResolveRootFlags(cmd)
+	if err != nil {
+		return nil, err
+	}
+	return &watch.RootOptions{
+		Namespace:        rootFlags.Namespace,
+		Image:            rootFlags.Image,
+		DiskSize:         rootFlags.DiskSize,
+		SecretName:       rootFlags.SecretName,
+		EphemeralStorage: rootFlags.EphemeralStorage,
+		CPURequest:       rootFlags.CPURequest,
+		CPULimit:         rootFlags.CPULimit,
+		MemoryRequest:    rootFlags.MemoryRequest,
+		MemoryLimit:      rootFlags.MemoryLimit,
+		ResolvedSecrets:  rootFlags.ResolvedSecrets,
+	}, nil
 }

@@ -1,4 +1,4 @@
-package commands
+package watch
 
 import (
 	"context"
@@ -20,6 +20,10 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"sigs.k8s.io/yaml"
 )
+
+func stringPtr(s string) *string {
+	return &s
+}
 
 func TestShouldRunChoreAt(t *testing.T) {
 	// Base mock "now" time: Wednesday, July 1st, 2026 at 9:55 AM UTC

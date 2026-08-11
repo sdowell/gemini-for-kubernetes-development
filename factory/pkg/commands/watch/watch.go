@@ -1,4 +1,4 @@
-package commands
+package watch
 
 import (
 	"bytes"
@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,8 +30,80 @@ import (
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/klog/v2"
 )
+
+func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
+	if val := os.Getenv(key); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			return d
+		}
+	}
+	return defaultValue
+}
+
+// Slugify converts arbitrary strings into clean alphanumeric slug identifiers.
+func Slugify(s string) string {
+	s = strings.ToLower(s)
+	s = strings.ReplaceAll(s, " ", "-")
+	var res strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			res.WriteRune(r)
+		}
+	}
+	return res.String()
+}
+
+func referencedIssueList(pr *githubv39.PullRequest) []int {
+	if pr == nil {
+		return nil
+	}
+	var out []int
+	for n := range getReferencedIssues(pr) {
+		out = append(out, n)
+	}
+	sort.Ints(out)
+	return out
+}
+
+func sandboxUsageMeta(item *unstructured.Unstructured, repo string) usagereport.Meta {
+	meta := usagereport.Meta{Repo: repo}
+	labels := item.GetLabels()
+	if prStr := labels["factory.gemini.google.com/pr"]; prStr != "" {
+		if n, err := strconv.Atoi(prStr); err == nil {
+			meta.PR = n
+		}
+	}
+	if wf := labels["factory.gemini.google.com/workflow"]; wf != "" {
+		meta.WorkflowName = wf
+	}
+	if numStr, ok := strings.CutPrefix(item.GetName(), "wf-issue-"); ok {
+		if n, err := strconv.Atoi(numStr); err == nil {
+			meta.Issue = n
+			meta.Workflow = "issue-" + numStr
+		}
+	}
+	return meta
+}
+
+// RootOptions holds resolved k8s and sandbox execution options passed from the root command.
+type RootOptions struct {
+	Namespace        string
+	Image            string
+	DiskSize         string
+	SecretName       string
+	EphemeralStorage string
+	CPURequest       string
+	CPULimit         string
+	MemoryRequest    string
+	MemoryLimit      string
+	ResolvedSecrets  []factorysandbox.SecretMount
+}
+
+// ResolveRootOptionsFunc defines a callback to resolve root-level CLI flags and configuration.
+type ResolveRootOptionsFunc func(cmd *cobra.Command) (*RootOptions, error)
 
 type WatchFlags struct {
 	Repo                string
@@ -54,7 +127,7 @@ type WatchFlags struct {
 	PRInactivityTimeout time.Duration
 }
 
-func NewWatchCommand(ctx context.Context) *cobra.Command {
+func NewWatchCommand(ctx context.Context, resolveRoot ResolveRootOptionsFunc) *cobra.Command {
 	var flags WatchFlags
 
 	cmd := &cobra.Command{
@@ -66,9 +139,18 @@ func NewWatchCommand(ctx context.Context) *cobra.Command {
   # Watch for assigned issues with labels
   factory watch --repo owner/repo --assignee "factory-bot" --labels "p0,urgent"`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			_, err := ResolveRootFlags(cmd)
-			if err != nil {
-				return err
+			var rootOpts *RootOptions
+			if resolveRoot != nil {
+				var err error
+				rootOpts, err = resolveRoot(cmd)
+				if err != nil {
+					return err
+				}
+			}
+			if rootOpts == nil {
+				rootOpts = &RootOptions{
+					Namespace: "default",
+				}
 			}
 
 			if flags.Repo == "" {
@@ -107,7 +189,7 @@ func NewWatchCommand(ctx context.Context) *cobra.Command {
 				choresMode = "enabled"
 			}
 
-			return runWatch(ctx, parts[0], parts[1], flags.PollInterval, flags.Assignee, cmd.Flags().Changed("assignee"), flags.Labels, flags.DryRun, flags.WatchTimeout, flags.MaxActions, flags.MaxPending, flags.Mode, flags.QueueDir, flags.Once, issueMode, prMode, choresMode, rootFlags.EphemeralStorage, rootFlags.ResolvedSecrets, flags.ScanLimit, flags.TaskTimeout, flags.SandboxEvictionAge, flags.SandboxIdleTimeout, flags.PRInactivityTimeout)
+			return runWatch(ctx, parts[0], parts[1], flags.PollInterval, flags.Assignee, cmd.Flags().Changed("assignee"), flags.Labels, flags.DryRun, flags.WatchTimeout, flags.MaxActions, flags.MaxPending, flags.Mode, flags.QueueDir, flags.Once, issueMode, prMode, choresMode, *rootOpts, flags.ScanLimit, flags.TaskTimeout, flags.SandboxEvictionAge, flags.SandboxIdleTimeout, flags.PRInactivityTimeout)
 		},
 	}
 
@@ -145,11 +227,11 @@ func assignedBotUser(issue *githubv39.Issue, botUsers []string) string {
 	return ""
 }
 
-func resolveSandboxName(ctx context.Context, kubeClient *clients.KubernetesClient, ghClient *githubv39.Client, taskType string, num int, owner, repo string) string {
+func resolveSandboxName(ctx context.Context, kubeClient *clients.KubernetesClient, ghClient *githubv39.Client, namespace, taskType string, num int, owner, repo string) string {
 	if taskType == "issue-fix" || taskType == "agent-chore" {
 		wfName := fmt.Sprintf("wf-issue-%d", num)
 		if kubeClient != nil {
-			if _, err := kubeClient.DynamicClient.Resource(k8s.SandboxGVR).Namespace(rootFlags.Namespace).Get(ctx, wfName, metav1.GetOptions{}); err == nil {
+			if _, err := kubeClient.DynamicClient.Resource(k8s.SandboxGVR).Namespace(namespace).Get(ctx, wfName, metav1.GetOptions{}); err == nil {
 				return wfName
 			}
 		}
@@ -161,7 +243,7 @@ func resolveSandboxName(ctx context.Context, kubeClient *clients.KubernetesClien
 		listOpts := metav1.ListOptions{
 			LabelSelector: fmt.Sprintf("factory.gemini.google.com/pr=%d", num),
 		}
-		sbs, err := kubeClient.DynamicClient.Resource(k8s.SandboxGVR).Namespace(rootFlags.Namespace).List(ctx, listOpts)
+		sbs, err := kubeClient.DynamicClient.Resource(k8s.SandboxGVR).Namespace(namespace).List(ctx, listOpts)
 		if err == nil && len(sbs.Items) > 0 {
 			return sbs.Items[0].GetName()
 		}
@@ -176,10 +258,10 @@ func resolveSandboxName(ctx context.Context, kubeClient *clients.KubernetesClien
 			for issueNum := range referencedIssues {
 				// Check if there is an active/existing sandbox for this issue
 				issueSandboxName := fmt.Sprintf("fix-%s-%d", repo, issueNum)
-				if _, err := kubeClient.DynamicClient.Resource(k8s.SandboxGVR).Namespace(rootFlags.Namespace).Get(ctx, issueSandboxName, metav1.GetOptions{}); err == nil {
+				if _, err := kubeClient.DynamicClient.Resource(k8s.SandboxGVR).Namespace(namespace).Get(ctx, issueSandboxName, metav1.GetOptions{}); err == nil {
 					// We found a matching issue sandbox! Alias it to the PR now for future lookups.
 					klog.Infof("Self-healing: Found matching issue sandbox '%s' for PR #%d. Aliasing sandbox to PR...", issueSandboxName, num)
-					if aliasErr := factorysandbox.AliasSandboxToPR(ctx, kubeClient, rootFlags.Namespace, issueSandboxName, num, pr.GetHTMLURL()); aliasErr != nil {
+					if aliasErr := factorysandbox.AliasSandboxToPR(ctx, kubeClient, namespace, issueSandboxName, num, pr.GetHTMLURL()); aliasErr != nil {
 						klog.Warningf("Failed to dynamically alias sandbox '%s' to PR #%d: %v", issueSandboxName, num, aliasErr)
 					}
 					return issueSandboxName
@@ -667,11 +749,212 @@ func getPRPriority(prIssue *githubv39.Issue) string {
 	return getIssuePriority(prIssue)
 }
 
+// AgentDefinition represents YAML frontmatter for an agent or workflow chore definition.
+type AgentDefinition struct {
+	Name        string `yaml:"name"`
+	Description string `yaml:"description"`
+	Schedule    string `yaml:"schedule"`
+	SkipPR      bool   `yaml:"skipPR,omitempty"`
+	Mode        string `yaml:"mode,omitempty"`
+	Cooldown    string `yaml:"cooldown,omitempty"`
+	Prompt      string `yaml:"-"`
+}
+
+// ParseAgent parses markdown/YAML frontmatter of an agent definition file.
+func ParseAgent(content []byte) (*AgentDefinition, error) {
+	parts := strings.SplitN(string(content), "---", 3)
+	if len(parts) < 3 {
+		return nil, fmt.Errorf("invalid agent definition format: missing frontmatter")
+	}
+
+	var def AgentDefinition
+	if err := yaml.Unmarshal([]byte(parts[1]), &def); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal frontmatter: %w", err)
+	}
+
+	def.Prompt = strings.TrimSpace(parts[2])
+	return &def, nil
+}
+
+func parseAgent(content []byte) (*AgentDefinition, error) {
+	return ParseAgent(content)
+}
+
+var (
+	reviewHeaderRe = regexp.MustCompile(`(?i)^(#{1,6})\s+Review\s+Instructions\s*$`)
+	listPrefixRe   = regexp.MustCompile(`^(?:[-*]|\d+\.)\s+`)
+)
+
+// ExtractReviewInstructions parses markdown bodies (e.g. PR description, parent Issue body)
+// and returns all lines under a "#/## Review Instructions" section.
+func ExtractReviewInstructions(bodies ...string) []string {
+	for _, body := range bodies {
+		instructions := parseReviewInstructionsSection(body)
+		if len(instructions) > 0 {
+			return instructions
+		}
+	}
+	return nil
+}
+
+func parseReviewInstructionsSection(body string) []string {
+	if strings.TrimSpace(body) == "" {
+		return nil
+	}
+
+	lines := strings.Split(body, "\n")
+	var instructions []string
+	inSection := false
+	sectionLevel := 0
+
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+
+		if !inSection {
+			if m := reviewHeaderRe.FindStringSubmatch(line); m != nil {
+				inSection = true
+				sectionLevel = len(m[1])
+			}
+			continue
+		}
+
+		if strings.HasPrefix(line, "#") {
+			hashes := 0
+			for _, ch := range line {
+				if ch == '#' {
+					hashes++
+				} else {
+					break
+				}
+			}
+			if hashes <= sectionLevel && len(line) > hashes && (line[hashes] == ' ' || line[hashes] == '\t') {
+				break
+			}
+		}
+
+		if line == "" {
+			continue
+		}
+
+		cleanLine := listPrefixRe.ReplaceAllString(line, "")
+		cleanLine = strings.TrimSpace(cleanLine)
+		if cleanLine != "" {
+			instructions = append(instructions, cleanLine)
+		}
+	}
+
+	return instructions
+}
+
+func parseGitHubURL(urlStr string) (owner, repo, branch, path string, ok bool) {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return "", "", "", "", false
+	}
+	if u.Host != "github.com" {
+		return "", "", "", "", false
+	}
+	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	if len(parts) < 4 || (parts[2] != "blob" && parts[2] != "raw") {
+		return "", "", "", "", false
+	}
+	owner = parts[0]
+	repo = parts[1]
+	branch = parts[3]
+	path = strings.Join(parts[4:], "/")
+	return owner, repo, branch, path, true
+}
+
+// FetchWorkflowContent retrieves the raw content of a workflow URL.
+func FetchWorkflowContent(ctx context.Context, ghClient *githubv39.Client, urlStr string) ([]byte, error) {
+	urlStr = SanitizeWorkflowPath(urlStr)
+	if owner, repo, branch, path, ok := parseGitHubURL(urlStr); ok {
+		klog.Infof("Fetching agent from GitHub repository %s/%s at branch/ref %s, path %s", owner, repo, branch, path)
+		fileContent, _, _, err := ghClient.Repositories.GetContents(ctx, owner, repo, path, &githubv39.RepositoryContentGetOptions{Ref: branch})
+		if err != nil {
+			return nil, fmt.Errorf("fetching content from GitHub repo: %w", err)
+		}
+		if fileContent == nil {
+			return nil, fmt.Errorf("content is nil (possibly a directory or submodule)")
+		}
+		contentStr, err := fileContent.GetContent()
+		if err != nil {
+			return nil, fmt.Errorf("decoding GitHub content: %w", err)
+		}
+		return []byte(contentStr), nil
+	}
+
+	klog.Infof("Fetching agent from HTTP URL %s", urlStr)
+	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad status fetching agent from URL %s: %s", urlStr, resp.Status)
+	}
+
+	buf := new(bytes.Buffer)
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		return nil, fmt.Errorf("reading agent body from URL %s: %w", urlStr, err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+func fetchWorkflowContent(ctx context.Context, ghClient *githubv39.Client, urlStr string) ([]byte, error) {
+	return FetchWorkflowContent(ctx, ghClient, urlStr)
+}
+
+func listAllCheckRuns(ctx context.Context, client *githubv39.Client, owner, repo, ref string) ([]*githubv39.CheckRun, error) {
+	var allRuns []*githubv39.CheckRun
+	opts := &githubv39.ListCheckRunsOptions{
+		ListOptions: githubv39.ListOptions{
+			PerPage: 200,
+		},
+	}
+	for {
+		runs, resp, err := client.Checks.ListCheckRunsForRef(ctx, owner, repo, ref, opts)
+		if err != nil {
+			return nil, err
+		}
+		allRuns = append(allRuns, runs.CheckRuns...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	latestRuns := make(map[string]*githubv39.CheckRun)
+	for _, run := range allRuns {
+		name := run.GetName()
+		if existing, ok := latestRuns[name]; ok {
+			if run.GetID() > existing.GetID() {
+				latestRuns[name] = run
+			}
+		} else {
+			latestRuns[name] = run
+		}
+	}
+
+	deduped := make([]*githubv39.CheckRun, 0, len(latestRuns))
+	for _, run := range latestRuns {
+		deduped = append(deduped, run)
+	}
+	return deduped, nil
+}
+
 var workflowURLRegex = regexp.MustCompile(`(?:\s|^)(https?://[^\s\)"'` + "`" + `]+(?:\.(?:md|txt|yaml)|/(?:workflows|agents)/)[^\s\)"'` + "`" + `]*)`)
 
 var workflowFileRegex = regexp.MustCompile(`(?:\s|^)(\.?\.?/?(?:\.?agents?|\.gemini)/[a-zA-Z0-9_\-\./]+)\b`)
 
-func sanitizeWorkflowPath(path string) string {
+// SanitizeWorkflowPath cleans up trailing escapes and newlines from matched paths.
+func SanitizeWorkflowPath(path string) string {
 	path = strings.TrimSpace(path)
 	for strings.HasSuffix(path, `\n`) || strings.HasSuffix(path, `\r`) {
 		path = strings.TrimSuffix(strings.TrimSuffix(path, `\n`), `\r`)
@@ -680,20 +963,30 @@ func sanitizeWorkflowPath(path string) string {
 	return path
 }
 
-func findWorkflowPath(body string) string {
+func sanitizeWorkflowPath(path string) string {
+	return SanitizeWorkflowPath(path)
+}
+
+// FindWorkflowPath extracts workflow URLs or relative agent paths from text.
+func FindWorkflowPath(body string) string {
 	urlMatch := workflowURLRegex.FindStringSubmatch(body)
 	if len(urlMatch) > 1 {
-		return sanitizeWorkflowPath(urlMatch[1])
+		return SanitizeWorkflowPath(urlMatch[1])
 	}
 
 	matches := workflowFileRegex.FindStringSubmatch(body)
 	if len(matches) > 1 {
-		return sanitizeWorkflowPath(matches[1])
+		return SanitizeWorkflowPath(matches[1])
 	}
 	return ""
 }
 
-func isWorkflowDefinition(ctx context.Context, ghClient *githubv39.Client, owner, repo, path string) bool {
+func findWorkflowPath(body string) string {
+	return FindWorkflowPath(body)
+}
+
+// IsWorkflowDefinition returns true if the referenced path is a valid workflow.
+func IsWorkflowDefinition(ctx context.Context, ghClient *githubv39.Client, owner, repo, path string) bool {
 	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
 		// 1. Path/URL convention check
 		if strings.Contains(path, "/workflows/") || strings.Contains(path, "/agents/") {
@@ -701,7 +994,7 @@ func isWorkflowDefinition(ctx context.Context, ghClient *githubv39.Client, owner
 		}
 
 		// 2. Download and verify headers
-		content, err := fetchWorkflowContent(ctx, ghClient, path)
+		content, err := FetchWorkflowContent(ctx, ghClient, path)
 		if err != nil {
 			klog.V(4).Infof("Failed to fetch content from workflow URL %s: %v", path, err)
 			return false
@@ -756,6 +1049,10 @@ func isWorkflowDefinition(ctx context.Context, ghClient *githubv39.Client, owner
 	return false
 }
 
+func isWorkflowDefinition(ctx context.Context, ghClient *githubv39.Client, owner, repo, path string) bool {
+	return IsWorkflowDefinition(ctx, ghClient, owner, repo, path)
+}
+
 func getWorkflowCooldown(ctx context.Context, ghClient *githubv39.Client, owner, repo, path string) time.Duration {
 	defaultCooldown := 10 * time.Minute
 	if path == "" {
@@ -794,7 +1091,7 @@ func getWorkflowCooldown(ctx context.Context, ghClient *githubv39.Client, owner,
 	return d
 }
 
-func queueIssueTasks(ctx context.Context, ghClient *githubv39.Client, kubeClient *clients.KubernetesClient, cfg *config.FactoryConfig, owner, repo string, issues []*githubv39.Issue, processedIssues map[int]time.Time, refIssues map[int]bool, targetAssignee string, allBotUsers []string, incomingDir, processingDir, processedDir, queueDir string, dryRun bool, triggerLabel string) {
+func queueIssueTasks(ctx context.Context, ghClient *githubv39.Client, kubeClient *clients.KubernetesClient, cfg *config.FactoryConfig, namespace, owner, repo string, issues []*githubv39.Issue, processedIssues map[int]time.Time, refIssues map[int]bool, targetAssignee string, allBotUsers []string, incomingDir, processingDir, processedDir, queueDir string, dryRun bool, triggerLabel string) {
 	klog.Infof("queueIssueTasks called with %d issues", len(issues))
 	for _, issue := range issues {
 		num := issue.GetNumber()
@@ -870,7 +1167,7 @@ func queueIssueTasks(ctx context.Context, ghClient *githubv39.Client, kubeClient
 				sandboxName = fmt.Sprintf("wf-issue-%d", num)
 			}
 
-			running, err := isSandboxTaskRunning(ctx, kubeClient, rootFlags.Namespace, sandboxName)
+			running, err := isSandboxTaskRunning(ctx, kubeClient, namespace, sandboxName)
 			if err != nil {
 				klog.Errorf("Failed to check if sandbox %s is running: %v", sandboxName, err)
 				continue
@@ -902,7 +1199,7 @@ func queueIssueTasks(ctx context.Context, ghClient *githubv39.Client, kubeClient
 				taskType = "agent-chore"
 			}
 
-			taskAssignee, err := selectUserForTask(ctx, ghClient, kubeClient, cfg, taskType, num, owner, repo)
+			taskAssignee, err := selectUserForTask(ctx, ghClient, kubeClient, namespace, cfg, taskType, num, owner, repo)
 			if err != nil {
 				klog.Errorf("Failed to select user for issue #%d: %v", num, err)
 				taskAssignee = targetAssignee
@@ -1099,7 +1396,7 @@ func writeTaskJournalEvent(queueDir string, taskFilename string, task *QueueTask
 	}
 }
 
-func runWatch(ctx context.Context, owner, repo string, interval time.Duration, assignee string, assigneeChanged bool, labels []string, dryRun bool, watchTimeout time.Duration, maxActions int, maxPending int, mode string, queueDir string, once bool, issueMode string, prMode string, choresMode string, ephemeralStorage string, secrets []factorysandbox.SecretMount, scanLimit int, taskTimeout time.Duration, sandboxEvictionAge string, sandboxIdleTimeout time.Duration, prInactivityTimeout time.Duration) error {
+func runWatch(ctx context.Context, owner, repo string, interval time.Duration, assignee string, assigneeChanged bool, labels []string, dryRun bool, watchTimeout time.Duration, maxActions int, maxPending int, mode string, queueDir string, once bool, issueMode string, prMode string, choresMode string, rootOpts RootOptions, scanLimit int, taskTimeout time.Duration, sandboxEvictionAge string, sandboxIdleTimeout time.Duration, prInactivityTimeout time.Duration) error {
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		klog.Warningf("Failed to load factory config: %v", err)
@@ -1119,11 +1416,11 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 		return fmt.Errorf("creating k8s client: %w", err)
 	}
 
-	secret, err := kubeClient.Clientset.CoreV1().Secrets(rootFlags.Namespace).Get(ctx, rootFlags.SecretName, metav1.GetOptions{})
+	secret, err := kubeClient.Clientset.CoreV1().Secrets(rootOpts.Namespace).Get(ctx, rootOpts.SecretName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("fetching %s secret in namespace %s: %w (make sure to run 'factory user onboard' first)", rootFlags.SecretName, rootFlags.Namespace, err)
+		return fmt.Errorf("fetching %s secret in namespace %s: %w (make sure to run 'factory user onboard' first)", rootOpts.SecretName, rootOpts.Namespace, err)
 	}
-	githubLogin := string(secret.Data[KeyGithubLogin])
+	githubLogin := string(secret.Data["GITHUB_LOGIN"])
 
 	targetAssignee := assignee
 	if !assigneeChanged {
@@ -1259,14 +1556,14 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 				if data, err := os.ReadFile(processingPath); err == nil {
 					var t QueueTask
 					if err := yaml.Unmarshal(data, &t); err == nil {
-						sandboxName := resolveSandboxName(ctx, kubeClient, ghClient, t.Type, t.Number, owner, repo)
+						sandboxName := resolveSandboxName(ctx, kubeClient, ghClient, rootOpts.Namespace, t.Type, t.Number, owner, repo)
 						if kubeClient != nil && sandboxName != "" {
-							running, err := isSandboxTaskRunning(ctx, kubeClient, rootFlags.Namespace, sandboxName)
+							running, err := isSandboxTaskRunning(ctx, kubeClient, rootOpts.Namespace, sandboxName)
 							if err == nil && running {
 								klog.Infof("Task %s is still actively running in sandbox %s. Leaving in processing.", f.Name(), sandboxName)
 								continue
 							}
-							completed, err := isSandboxTaskCompleted(ctx, kubeClient, rootFlags.Namespace, sandboxName, t.Type)
+							completed, err := isSandboxTaskCompleted(ctx, kubeClient, rootOpts.Namespace, sandboxName, t.Type)
 							if err == nil && completed {
 								klog.Infof("Task %s already completed in sandbox %s. Moving from processing to processed.", f.Name(), sandboxName)
 								t.Status = "Completed"
@@ -1328,30 +1625,30 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 
 		// Proactively delete any evicted sandbox pods in the namespace so the sandbox controller can recreate them or free resources.
 		func() {
-			podList, err := kubeClient.Clientset.CoreV1().Pods(rootFlags.Namespace).List(ctx, metav1.ListOptions{LabelSelector: "sandbox"})
+			podList, err := kubeClient.Clientset.CoreV1().Pods(rootOpts.Namespace).List(ctx, metav1.ListOptions{LabelSelector: "sandbox"})
 			if err != nil {
 				return
 			}
 			for i := range podList.Items {
 				pod := &podList.Items[i]
 				if pod.DeletionTimestamp == nil && pod.Status.Phase == corev1.PodFailed && strings.EqualFold(pod.Status.Reason, "Evicted") {
-					klog.Infof("Found evicted sandbox pod %s in namespace %s. Deleting pod so controller can recreate or clean up.", pod.Name, rootFlags.Namespace)
+					klog.Infof("Found evicted sandbox pod %s in namespace %s. Deleting pod so controller can recreate or clean up.", pod.Name, rootOpts.Namespace)
 					sbName := pod.Labels["sandbox"]
 					if sbName == "" {
 						sbName = pod.Labels["agents.x-k8s.io/sandbox"]
 					}
 					if sbName != "" {
-						_ = factorysandbox.IncrementSandboxEvictionCount(ctx, kubeClient, rootFlags.Namespace, sbName)
+						_ = factorysandbox.IncrementSandboxEvictionCount(ctx, kubeClient, rootOpts.Namespace, sbName)
 					}
-					_ = kubeClient.Clientset.CoreV1().Pods(rootFlags.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+					_ = kubeClient.Clientset.CoreV1().Pods(rootOpts.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
 				}
 			}
 		}()
 
-		reconcileRunningSandboxes(ctx, kubeClient, rootFlags.Namespace)
+		reconcileRunningSandboxes(ctx, kubeClient, rootOpts.Namespace)
 
 		if isDoNotProcess(queueDir) {
-			runningCount, err := countRunningSandboxTasks(ctx, kubeClient, rootFlags.Namespace)
+			runningCount, err := countRunningSandboxTasks(ctx, kubeClient, rootOpts.Namespace)
 			if err != nil {
 				klog.Errorf("Failed to count running sandbox tasks during drain: %v", err)
 			}
@@ -1478,8 +1775,8 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 
 					filename := fmt.Sprintf("task-pr-%d-iterate.yaml", num)
 					if !taskExists(incomingDir, processingDir, filename) {
-						sandboxName := resolveSandboxName(ctx, kubeClient, ghClient, "pr-iterate", num, owner, repo)
-						running, err := isSandboxTaskRunning(ctx, kubeClient, rootFlags.Namespace, sandboxName)
+						sandboxName := resolveSandboxName(ctx, kubeClient, ghClient, rootOpts.Namespace, "pr-iterate", num, owner, repo)
+						running, err := isSandboxTaskRunning(ctx, kubeClient, rootOpts.Namespace, sandboxName)
 						if err != nil {
 							klog.Errorf("Failed to check if sandbox %s is running: %v", sandboxName, err)
 							continue
@@ -1623,8 +1920,8 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 							}
 
 							if state.lastSHA != headSHA || prevFailed || isExplicitlyAssigned || time.Since(state.lastInvestigatedTime) > 2*time.Hour {
-								sandboxName := resolveSandboxName(ctx, kubeClient, ghClient, "pr-investigate", num, owner, repo)
-								running, err := isSandboxTaskRunning(ctx, kubeClient, rootFlags.Namespace, sandboxName)
+								sandboxName := resolveSandboxName(ctx, kubeClient, ghClient, rootOpts.Namespace, "pr-investigate", num, owner, repo)
+								running, err := isSandboxTaskRunning(ctx, kubeClient, rootOpts.Namespace, sandboxName)
 								if err != nil {
 									klog.Errorf("Failed to check if sandbox %s is running: %v", sandboxName, err)
 								} else if running {
@@ -1792,8 +2089,8 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 						}
 						filename := fmt.Sprintf("task-pr-%d-comments.yaml", num)
 						if !taskExists(incomingDir, processingDir, filename) {
-							sandboxName := resolveSandboxName(ctx, kubeClient, ghClient, "pr-comments", num, owner, repo)
-							running, err := isSandboxTaskRunning(ctx, kubeClient, rootFlags.Namespace, sandboxName)
+							sandboxName := resolveSandboxName(ctx, kubeClient, ghClient, rootOpts.Namespace, "pr-comments", num, owner, repo)
+							running, err := isSandboxTaskRunning(ctx, kubeClient, rootOpts.Namespace, sandboxName)
 							if err != nil {
 								klog.Errorf("Failed to check if sandbox %s is running: %v", sandboxName, err)
 								continue
@@ -1855,8 +2152,8 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 							}
 							filename := fmt.Sprintf("task-pr-%d-review.yaml", num)
 							if !taskExists(incomingDir, processingDir, filename) {
-								sandboxName := resolveSandboxName(ctx, kubeClient, ghClient, "pr-review", num, owner, repo)
-								running, err := isSandboxTaskRunning(ctx, kubeClient, rootFlags.Namespace, sandboxName)
+								sandboxName := resolveSandboxName(ctx, kubeClient, ghClient, rootOpts.Namespace, "pr-review", num, owner, repo)
+								running, err := isSandboxTaskRunning(ctx, kubeClient, rootOpts.Namespace, sandboxName)
 								if err != nil {
 									klog.Errorf("Failed to check if sandbox %s is running: %v", sandboxName, err)
 									continue
@@ -2005,7 +2302,7 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 
 			// Process slow issues
 			if issueMode != "disabled" {
-				queueIssueTasks(ctx, ghClient, kubeClient, cfg, owner, repo, slowIssues, processedIssues, refIssues, targetAssignee, allBotUsers, incomingDir, processingDir, processedDir, queueDir, dryRun, triggerLabel)
+				queueIssueTasks(ctx, ghClient, kubeClient, cfg, rootOpts.Namespace, owner, repo, slowIssues, processedIssues, refIssues, targetAssignee, allBotUsers, incomingDir, processingDir, processedDir, queueDir, dryRun, triggerLabel)
 			}
 
 			// Process Pull Requests (Scanner)
@@ -2086,22 +2383,22 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 			}
 
 			// Clean up sandboxes of merged or closed PRs
-			if err := cleanupClosedPRSandboxes(ctx, ghClient, kubeClient, owner, repo, rootFlags.Namespace, openPRMap, dryRun); err != nil {
+			if err := cleanupClosedPRSandboxes(ctx, ghClient, kubeClient, owner, repo, rootOpts.Namespace, openPRMap, dryRun); err != nil {
 				klog.Errorf("Failed to clean up closed PR sandboxes: %v", err)
 			}
 
 			// Clean up sandboxes of closed issues
-			if err := cleanupClosedIssueSandboxes(ctx, ghClient, kubeClient, owner, repo, rootFlags.Namespace, openIssueMap, dryRun); err != nil {
+			if err := cleanupClosedIssueSandboxes(ctx, ghClient, kubeClient, owner, repo, rootOpts.Namespace, openIssueMap, dryRun); err != nil {
 				klog.Errorf("Failed to clean up closed issue sandboxes: %v", err)
 			}
 
 			// Clean up stale idle sandboxes older than eviction age (defaults to 1 week)
-			if err := cleanupStaleIdleSandboxes(ctx, kubeClient, owner+"/"+repo, rootFlags.Namespace, sandboxEvictionAge, dryRun); err != nil {
+			if err := cleanupStaleIdleSandboxes(ctx, kubeClient, owner+"/"+repo, rootOpts.Namespace, sandboxEvictionAge, dryRun); err != nil {
 				klog.Errorf("Failed to clean up stale idle sandboxes: %v", err)
 			}
 
 			if sandboxIdleTimeout > 0 {
-				if _, err := factorysandbox.SuspendIdleSandboxes(ctx, kubeClient, rootFlags.Namespace, sandboxIdleTimeout, dryRun); err != nil {
+				if _, err := factorysandbox.SuspendIdleSandboxes(ctx, kubeClient, rootOpts.Namespace, sandboxIdleTimeout, dryRun); err != nil {
 					klog.Errorf("Failed to suspend idle sandboxes: %v", err)
 				}
 			}
@@ -2219,7 +2516,7 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 			}
 
 			if issueMode != "disabled" {
-				queueIssueTasks(ctx, ghClient, kubeClient, cfg, owner, repo, issues, processedIssues, refIssues, targetAssignee, allBotUsers, incomingDir, processingDir, processedDir, queueDir, dryRun, triggerLabel)
+				queueIssueTasks(ctx, ghClient, kubeClient, cfg, rootOpts.Namespace, owner, repo, issues, processedIssues, refIssues, targetAssignee, allBotUsers, incomingDir, processingDir, processedDir, queueDir, dryRun, triggerLabel)
 			}
 
 			// Process PRs assigned to the bot in the fast cycle
@@ -2301,7 +2598,7 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 					break
 				}
 
-				runningCount, err := countRunningSandboxTasks(ctx, kubeClient, rootFlags.Namespace)
+				runningCount, err := countRunningSandboxTasks(ctx, kubeClient, rootOpts.Namespace)
 				if err != nil {
 					klog.Errorf("Failed to count running sandbox tasks: %v", err)
 				}
@@ -2315,13 +2612,13 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 				filename := item.filename
 				task := item.task
 
-				sandboxName := resolveSandboxName(ctx, kubeClient, ghClient, task.Type, task.Number, owner, repo)
+				sandboxName := resolveSandboxName(ctx, kubeClient, ghClient, rootOpts.Namespace, task.Type, task.Number, owner, repo)
 				if activeSandboxesInCycle[sandboxName] {
 					klog.Infof("Skipping task %s because sandbox %s is already scheduled to run a task in this cycle.", filename, sandboxName)
 					continue
 				}
 
-				running, err := isSandboxTaskRunning(ctx, kubeClient, rootFlags.Namespace, sandboxName)
+				running, err := isSandboxTaskRunning(ctx, kubeClient, rootOpts.Namespace, sandboxName)
 				if err != nil {
 					klog.Errorf("Failed to check if sandbox %s is running: %v", sandboxName, err)
 					continue
@@ -2342,7 +2639,7 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 				}
 
 				if task.Type != "agent-chore" && task.Recovered {
-					completed, err := isSandboxTaskCompleted(ctx, kubeClient, rootFlags.Namespace, sandboxName, task.Type)
+					completed, err := isSandboxTaskCompleted(ctx, kubeClient, rootOpts.Namespace, sandboxName, task.Type)
 					if err != nil {
 						klog.Errorf("Failed to check if sandbox %s completed task: %v", sandboxName, err)
 						continue
@@ -2434,7 +2731,7 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 					selectedUser := t.Assignee
 					var sUserErr error
 					if selectedUser == "" || (isPRTask(t.Type) && strings.EqualFold(selectedUser, targetAssignee)) {
-						selectedUser, sUserErr = selectUserForTask(ctx, ghClient, kubeClient, cfg, t.Type, t.Number, owner, repo)
+						selectedUser, sUserErr = selectUserForTask(ctx, ghClient, kubeClient, rootOpts.Namespace, cfg, t.Type, t.Number, owner, repo)
 					}
 					if sUserErr != nil {
 						klog.Errorf("Failed to select user for task %s: %v", taskFilename, sUserErr)
@@ -2478,32 +2775,40 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 						return
 					}
 
-					if rootFlags.Namespace != "" {
-						args = append(args, "--namespace", rootFlags.Namespace)
+					if rootOpts.Namespace != "" {
+						args = append(args, "--namespace", rootOpts.Namespace)
 					}
 					if selectedUser != "" {
 						args = append(args, "--user", selectedUser)
 					}
-					if rootFlags.Image != "" {
-						args = append(args, "--image", rootFlags.Image)
+					if rootOpts.Image != "" {
+						args = append(args, "--image", rootOpts.Image)
 					}
-					if rootFlags.DiskSize != "" {
-						args = append(args, "--workspace-disk-size", rootFlags.DiskSize)
+					if rootOpts.DiskSize != "" {
+						args = append(args, "--workspace-disk-size", rootOpts.DiskSize)
 					}
-					if rootFlags.EphemeralStorage != "" {
-						args = append(args, "--ephemeral-storage", rootFlags.EphemeralStorage)
+					if rootOpts.EphemeralStorage != "" {
+						args = append(args, "--ephemeral-storage", rootOpts.EphemeralStorage)
 					}
-					if rootFlags.CPURequest != "" {
-						args = append(args, "--cpu-request", rootFlags.CPURequest)
+					if rootOpts.CPURequest != "" {
+						args = append(args, "--cpu-request", rootOpts.CPURequest)
 					}
-					if rootFlags.CPULimit != "" {
-						args = append(args, "--cpu-limit", rootFlags.CPULimit)
+					if rootOpts.CPULimit != "" {
+						args = append(args, "--cpu-limit", rootOpts.CPULimit)
 					}
-					if rootFlags.MemoryRequest != "" {
-						args = append(args, "--memory-request", rootFlags.MemoryRequest)
+					if rootOpts.MemoryRequest != "" {
+						args = append(args, "--memory-request", rootOpts.MemoryRequest)
 					}
-					if rootFlags.MemoryLimit != "" {
-						args = append(args, "--memory-limit", rootFlags.MemoryLimit)
+					if rootOpts.MemoryLimit != "" {
+						args = append(args, "--memory-limit", rootOpts.MemoryLimit)
+					}
+					if rootOpts.SecretName != "" {
+						args = append(args, "--secret-name", rootOpts.SecretName)
+					}
+					for _, secretMount := range rootOpts.ResolvedSecrets {
+						if secretMount.Name != "" && secretMount.MountPath != "" {
+							args = append(args, "--secret-mount", fmt.Sprintf("%s=%s", secretMount.Name, secretMount.MountPath))
+						}
 					}
 					if taskTimeout > 0 {
 						args = append(args, "--timeout", taskTimeout.String())
@@ -2558,13 +2863,13 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 									sandboxName = fmt.Sprintf("agent-%s-%d", repo, t.Number)
 								}
 							case "pr-investigate", "pr-comments", "pr-iterate", "pr-review":
-								sandboxName = resolveSandboxName(ctx, kubeClient, ghClient, t.Type, t.Number, owner, repo)
+								sandboxName = resolveSandboxName(ctx, kubeClient, ghClient, rootOpts.Namespace, t.Type, t.Number, owner, repo)
 							}
 
 							if sandboxName != "" {
 								klog.Warningf("Task %s timed out after %s! Force cleaning up sandbox '%s'...", taskFilename, taskTimeout, sandboxName)
 								manager := k8s.NewManager(kubeClient)
-								if err := manager.DeleteSandbox(ctx, rootFlags.Namespace, sandboxName); err != nil {
+								if err := manager.DeleteSandbox(ctx, rootOpts.Namespace, sandboxName); err != nil {
 									klog.Errorf("Failed to delete sandbox '%s' on timeout: %v", sandboxName, err)
 								}
 							}
@@ -2635,7 +2940,8 @@ func runWatch(ctx context.Context, owner, repo string, interval time.Duration, a
 	}
 }
 
-func getReferencedIssues(pr *githubv39.PullRequest) map[int]bool {
+// GetReferencedIssues inspects PR head branch, title, and body for linked issue numbers.
+func GetReferencedIssues(pr *githubv39.PullRequest) map[int]bool {
 	referenced := make(map[int]bool)
 
 	// Check branch name, ignoring epoch timestamps (num >= 10000000)
@@ -2661,6 +2967,10 @@ func getReferencedIssues(pr *githubv39.PullRequest) map[int]bool {
 	}
 
 	return referenced
+}
+
+func getReferencedIssues(pr *githubv39.PullRequest) map[int]bool {
+	return GetReferencedIssues(pr)
 }
 
 func listAllOpenPRs(ctx context.Context, ghClient *githubv39.Client, owner, repo string) ([]*githubv39.PullRequest, error) {
@@ -3144,7 +3454,7 @@ func cleanupClosedIssueSandboxes(ctx context.Context, ghClient *githubv39.Client
 	return nil
 }
 
-func selectUserForTask(ctx context.Context, ghClient *githubv39.Client, kubeClient *clients.KubernetesClient, cfg *config.FactoryConfig, taskType string, prNum int, owner, repo string) (string, error) {
+func selectUserForTask(ctx context.Context, ghClient *githubv39.Client, kubeClient *clients.KubernetesClient, namespace string, cfg *config.FactoryConfig, taskType string, prNum int, owner, repo string) (string, error) {
 	if cfg == nil || len(cfg.Roles) == 0 {
 		return "", nil // default fallback to factory-user
 	}
@@ -3231,7 +3541,7 @@ func selectUserForTask(ctx context.Context, ghClient *githubv39.Client, kubeClie
 			}
 
 			if sandboxName != "" && kubeClient != nil {
-				sb, err := kubeClient.DynamicClient.Resource(k8s.SandboxGVR).Namespace(rootFlags.Namespace).Get(ctx, sandboxName, metav1.GetOptions{})
+				sb, err := kubeClient.DynamicClient.Resource(k8s.SandboxGVR).Namespace(namespace).Get(ctx, sandboxName, metav1.GetOptions{})
 				if err == nil {
 					labels := sb.GetLabels()
 					if user, ok := labels["factory.gemini.google.com/user"]; ok && user != "" {

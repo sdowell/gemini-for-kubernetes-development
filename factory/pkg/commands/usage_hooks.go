@@ -21,10 +21,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch"
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/usagereport"
 	githubv39 "github.com/google/go-github/v39/github"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-
-	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/usagereport"
 )
 
 // referencedIssueList converts getReferencedIssues output into the sorted
@@ -34,7 +34,7 @@ func referencedIssueList(pr *githubv39.PullRequest) []int {
 		return nil
 	}
 	var out []int
-	for n := range getReferencedIssues(pr) {
+	for n := range watch.GetReferencedIssues(pr) {
 		out = append(out, n)
 	}
 	sort.Ints(out)
