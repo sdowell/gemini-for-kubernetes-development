@@ -22,12 +22,12 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	sandboxapi "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	overseerv1alpha1 "github.com/gke-labs/gemini-for-kubernetes-development/overseer/pkg/api/v1alpha1"
@@ -37,15 +37,8 @@ func setupTestScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(s)
 	_ = overseerv1alpha1.AddToScheme(s)
+	_ = sandboxapi.AddToScheme(s)
 	return s
-}
-
-func sandboxGVK() schema.GroupVersionKind {
-	return schema.GroupVersionKind{
-		Group:   "agents.x-k8s.io",
-		Version: "v1alpha1",
-		Kind:    "Sandbox",
-	}
 }
 
 func TestReconcileOverseer_CreateSandbox(t *testing.T) {
@@ -75,8 +68,7 @@ func TestReconcileOverseer_CreateSandbox(t *testing.T) {
 		t.Errorf("expected OverseerStatus to be 'Active', got: %q", overseer.Status.OverseerStatus)
 	}
 
-	sandbox := &unstructured.Unstructured{}
-	sandbox.SetGroupVersionKind(sandboxGVK())
+	sandbox := &sandboxapi.Sandbox{}
 	err := k8sClient.Get(ctx, types.NamespacedName{Name: "overseer-test-agent", Namespace: "overseer-test-agent"}, sandbox)
 	if err != nil {
 		t.Fatalf("expected sandbox to be created, got error: %v", err)
@@ -124,35 +116,21 @@ func TestReconcileOverseer_CreateSandbox_WithTokenScript(t *testing.T) {
 		t.Fatalf("unexpected error from ReconcileOverseer: %v", err)
 	}
 
-	sandbox := &unstructured.Unstructured{}
-	sandbox.SetGroupVersionKind(sandboxGVK())
+	sandbox := &sandboxapi.Sandbox{}
 	err := k8sClient.Get(ctx, types.NamespacedName{Name: "overseer-agent-ts", Namespace: "overseer-agent-ts"}, sandbox)
 	if err != nil {
 		t.Fatalf("failed to get created sandbox: %v", err)
 	}
 
 	// Verify tokenscript volume is present
-	spec, ok := sandbox.Object["spec"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("missing or invalid spec on sandbox: %v", sandbox.Object)
-	}
-	podTemplate, ok := spec["podTemplate"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("missing podTemplate: %v", spec)
-	}
-	podSpec, ok := podTemplate["spec"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("missing podSpec: %v", podTemplate)
-	}
-	volumes, ok := podSpec["volumes"].([]interface{})
-	if !ok || len(volumes) == 0 {
-		t.Fatalf("expected volumes in podSpec when tokenscript is present: %v", podSpec)
+	volumes := sandbox.Spec.PodTemplate.Spec.Volumes
+	if len(volumes) == 0 {
+		t.Fatalf("expected volumes in podSpec when tokenscript is present")
 	}
 
 	hasTSVol := false
 	for _, v := range volumes {
-		vMap, ok := v.(map[string]interface{})
-		if ok && vMap["name"] == "tokenscript-vol" {
+		if v.Name == "tokenscript-vol" {
 			hasTSVol = true
 			break
 		}
@@ -268,8 +246,7 @@ func TestReconcileOverseer_SpecChanged_UpdatesSandboxAndDeletesPod(t *testing.T)
 	}
 
 	// 1. Verify sandbox spec was updated
-	updatedSandbox := &unstructured.Unstructured{}
-	updatedSandbox.SetGroupVersionKind(sandboxGVK())
+	updatedSandbox := &sandboxapi.Sandbox{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: "overseer-agent-update", Namespace: "overseer-agent-update"}, updatedSandbox); err != nil {
 		t.Fatalf("failed to get updated sandbox: %v", err)
 	}
@@ -355,9 +332,93 @@ func TestReconcileOverseer_LongNameTruncation(t *testing.T) {
 		expectedName = expectedName[:63]
 	}
 
-	sandbox := &unstructured.Unstructured{}
-	sandbox.SetGroupVersionKind(sandboxGVK())
+	sandbox := &sandboxapi.Sandbox{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: expectedName, Namespace: expectedName}, sandbox); err != nil {
 		t.Fatalf("expected sandbox with truncated name %q to exist, got error: %v", expectedName, err)
+	}
+}
+
+func TestReconcileOverseer_CreateSandbox_CustomResourceQuantities(t *testing.T) {
+	scheme := setupTestScheme()
+	ctx := context.Background()
+
+	workspaceDiskSize := resource.MustParse("50Gi")
+	ephemeralStorage := resource.MustParse("20Gi")
+	sandboxCPURequest := resource.MustParse("4000m")
+	sandboxCPULimit := resource.MustParse("8000m")
+	sandboxMemoryRequest := resource.MustParse("8Gi")
+	sandboxMemoryLimit := resource.MustParse("16Gi")
+
+	overseer := &overseerv1alpha1.Overseer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "custom-resources",
+		},
+		Spec: overseerv1alpha1.OverseerSpec{
+			RepoURL:              "https://github.com/example/repo",
+			WorkspaceDiskSize:    workspaceDiskSize,
+			EphemeralStorage:     ephemeralStorage,
+			SandboxCPURequest:    sandboxCPURequest,
+			SandboxCPULimit:      sandboxCPULimit,
+			SandboxMemoryRequest: sandboxMemoryRequest,
+			SandboxMemoryLimit:   sandboxMemoryLimit,
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(overseer).
+		Build()
+
+	if err := ReconcileOverseer(ctx, k8sClient, overseer); err != nil {
+		t.Fatalf("unexpected error from ReconcileOverseer: %v", err)
+	}
+
+	sandbox := &sandboxapi.Sandbox{}
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: "overseer-custom-resources", Namespace: "overseer-custom-resources"}, sandbox)
+	if err != nil {
+		t.Fatalf("expected sandbox to be created, got error: %v", err)
+	}
+
+	// Verify ephemeral storage on container resources
+	containers := sandbox.Spec.PodTemplate.Spec.Containers
+	if len(containers) == 0 {
+		t.Fatalf("expected at least one container in sandbox")
+	}
+	mainContainer := containers[0]
+	if req := mainContainer.Resources.Requests[corev1.ResourceEphemeralStorage]; req.Cmp(ephemeralStorage) != 0 {
+		t.Errorf("expected ephemeral storage request %s, got %s", ephemeralStorage.String(), req.String())
+	}
+	if lim := mainContainer.Resources.Limits[corev1.ResourceEphemeralStorage]; lim.Cmp(ephemeralStorage) != 0 {
+		t.Errorf("expected ephemeral storage limit %s, got %s", ephemeralStorage.String(), lim.String())
+	}
+
+	// Verify workspace disk size on PVC template
+	pvcs := sandbox.Spec.VolumeClaimTemplates
+	if len(pvcs) == 0 {
+		t.Fatalf("expected at least one volume claim template")
+	}
+	if req := pvcs[0].Spec.Resources.Requests[corev1.ResourceStorage]; req.Cmp(workspaceDiskSize) != 0 {
+		t.Errorf("expected storage request %s, got %s", workspaceDiskSize.String(), req.String())
+	}
+
+	// Verify environment variables
+	expectedEnv := map[string]string{
+		"WORKSPACE_DISK_SIZE":    workspaceDiskSize.String(),
+		"EPHEMERAL_STORAGE":      ephemeralStorage.String(),
+		"SANDBOX_CPU_REQUEST":    sandboxCPURequest.String(),
+		"SANDBOX_CPU_LIMIT":      sandboxCPULimit.String(),
+		"SANDBOX_MEMORY_REQUEST": sandboxMemoryRequest.String(),
+		"SANDBOX_MEMORY_LIMIT":   sandboxMemoryLimit.String(),
+	}
+
+	envMap := make(map[string]string)
+	for _, envVar := range mainContainer.Env {
+		envMap[envVar.Name] = envVar.Value
+	}
+
+	for k, expectedVal := range expectedEnv {
+		if val, ok := envMap[k]; !ok || val != expectedVal {
+			t.Errorf("expected env var %s to be %q, got %q (present: %v)", k, expectedVal, val, ok)
+		}
 	}
 }

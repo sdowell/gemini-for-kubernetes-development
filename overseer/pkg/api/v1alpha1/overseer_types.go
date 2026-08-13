@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -107,28 +108,28 @@ type OverseerSpec struct {
 	// WorkspaceDiskSize specifies the disk size for the workspace PVC.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:default="10Gi"
-	WorkspaceDiskSize string `json:"workspaceDiskSize,omitempty"`
+	WorkspaceDiskSize resource.Quantity `json:"workspaceDiskSize,omitempty"`
 
 	// EphemeralStorage specifies the ephemeral storage size for the overseer pod.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:default="10Gi"
-	EphemeralStorage string `json:"ephemeralStorage,omitempty"`
+	EphemeralStorage resource.Quantity `json:"ephemeralStorage,omitempty"`
 
 	// SandboxCPURequest specifies the CPU request for child sandboxes.
 	// +kubebuilder:validation:Optional
-	SandboxCPURequest string `json:"sandboxCPURequest,omitempty"`
+	SandboxCPURequest resource.Quantity `json:"sandboxCPURequest,omitempty"`
 
 	// SandboxCPULimit specifies the CPU limit for child sandboxes.
 	// +kubebuilder:validation:Optional
-	SandboxCPULimit string `json:"sandboxCPULimit,omitempty"`
+	SandboxCPULimit resource.Quantity `json:"sandboxCPULimit,omitempty"`
 
 	// SandboxMemoryRequest specifies the memory request for child sandboxes.
 	// +kubebuilder:validation:Optional
-	SandboxMemoryRequest string `json:"sandboxMemoryRequest,omitempty"`
+	SandboxMemoryRequest resource.Quantity `json:"sandboxMemoryRequest,omitempty"`
 
 	// SandboxMemoryLimit specifies the memory limit for child sandboxes.
 	// +kubebuilder:validation:Optional
-	SandboxMemoryLimit string `json:"sandboxMemoryLimit,omitempty"`
+	SandboxMemoryLimit resource.Quantity `json:"sandboxMemoryLimit,omitempty"`
 
 	// Review configuration for PRs
 	// +kubebuilder:validation:Optional

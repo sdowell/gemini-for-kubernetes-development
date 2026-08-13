@@ -23,11 +23,13 @@ import (
 	"os"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	sandboxapi "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -58,14 +60,6 @@ func ReconcileOverseer(ctx context.Context, c client.Client, o *overseerv1alpha1
 		namespace = namespace[:63]
 	}
 
-	// Define the sandbox object
-	sandbox := &unstructured.Unstructured{}
-	sandbox.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "agents.x-k8s.io",
-		Version: "v1alpha1",
-		Kind:    "Sandbox",
-	})
-
 	hasTokenScript := false
 	secret := &corev1.Secret{}
 	if err := c.Get(ctx, types.NamespacedName{Name: "tokenscript", Namespace: namespace}, secret); err == nil {
@@ -74,6 +68,7 @@ func ReconcileOverseer(ctx context.Context, c client.Client, o *overseerv1alpha1
 		return err
 	}
 
+	sandbox := &sandboxapi.Sandbox{}
 	err := c.Get(ctx, types.NamespacedName{Name: overseerName, Namespace: namespace}, sandbox)
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -94,15 +89,10 @@ func ReconcileOverseer(ctx context.Context, c client.Client, o *overseerv1alpha1
 
 	// If exists, compare spec and update if changed
 	desiredSandbox := newOverseerSandboxFromOverseer(o, overseerName, namespace, hasTokenScript)
-	existingSpec := sandbox.Object["spec"]
-	desiredSpec := desiredSandbox.Object["spec"]
 
-	existingJSON, _ := json.Marshal(existingSpec)
-	desiredJSON, _ := json.Marshal(desiredSpec)
-
-	if string(existingJSON) != string(desiredJSON) {
+	if !apiequality.Semantic.DeepEqual(sandbox.Spec, desiredSandbox.Spec) {
 		log.Info("Updating Overseer sandbox spec", "name", overseerName, "namespace", namespace)
-		sandbox.Object["spec"] = desiredSpec
+		sandbox.Spec = desiredSandbox.Spec
 		if err := c.Update(ctx, sandbox); err != nil {
 			return fmt.Errorf("updating sandbox spec: %w", err)
 		}
@@ -124,7 +114,7 @@ func ReconcileOverseer(ctx context.Context, c client.Client, o *overseerv1alpha1
 	return nil
 }
 
-func newOverseerSandboxFromOverseer(o *overseerv1alpha1.Overseer, name, namespace string, hasTokenScript bool) *unstructured.Unstructured {
+func newOverseerSandboxFromOverseer(o *overseerv1alpha1.Overseer, name, namespace string, hasTokenScript bool) *sandboxapi.Sandbox {
 	image := os.Getenv("OVERSEER_IMAGE")
 
 	secretName := "factory-user"
@@ -132,351 +122,339 @@ func newOverseerSandboxFromOverseer(o *overseerv1alpha1.Overseer, name, namespac
 		secretName = fmt.Sprintf("user-%s", roleSpec.Users[0])
 	}
 
-	env := []interface{}{
-		map[string]interface{}{
-			"name": "GITHUB_TOKEN",
-			"valueFrom": map[string]interface{}{
-				"secretKeyRef": map[string]interface{}{
-					"name":     secretName,
-					"key":      "GITHUB_TOKEN",
-					"optional": true,
+	env := []corev1.EnvVar{
+		{
+			Name: "GITHUB_TOKEN",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: secretName,
+					},
+					Key:      "GITHUB_TOKEN",
+					Optional: ptr.To(true),
 				},
 			},
 		},
-		map[string]interface{}{
-			"name": "GITHUB_LOGIN",
-			"valueFrom": map[string]interface{}{
-				"secretKeyRef": map[string]interface{}{
-					"name":     secretName,
-					"key":      "GITHUB_LOGIN",
-					"optional": true,
+		{
+			Name: "GITHUB_LOGIN",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: secretName,
+					},
+					Key:      "GITHUB_LOGIN",
+					Optional: ptr.To(true),
 				},
 			},
 		},
-		map[string]interface{}{
-			"name": "GITHUB_EMAIL",
-			"valueFrom": map[string]interface{}{
-				"secretKeyRef": map[string]interface{}{
-					"name":     secretName,
-					"key":      "GITHUB_EMAIL",
-					"optional": true,
+		{
+			Name: "GITHUB_EMAIL",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: secretName,
+					},
+					Key:      "GITHUB_EMAIL",
+					Optional: ptr.To(true),
 				},
 			},
 		},
-		map[string]interface{}{
-			"name": "GEMINI_API_KEY",
-			"valueFrom": map[string]interface{}{
-				"secretKeyRef": map[string]interface{}{
-					"name":     secretName,
-					"key":      "GEMINI_API_KEY",
-					"optional": true,
+		{
+			Name: "GEMINI_API_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: secretName,
+					},
+					Key:      "GEMINI_API_KEY",
+					Optional: ptr.To(true),
 				},
 			},
 		},
-		map[string]interface{}{
-			"name":  "GITHUB_API_URL",
-			"value": "http://github-portal.overseer-system.svc.cluster.local/",
+		{
+			Name:  "GITHUB_API_URL",
+			Value: "http://github-portal.overseer-system.svc.cluster.local/",
 		},
-		map[string]interface{}{
-			"name":  "GEMINI_CLI_TRUST_WORKSPACE",
-			"value": "true",
+		{
+			Name:  "GEMINI_CLI_TRUST_WORKSPACE",
+			Value: "true",
 		},
-		map[string]interface{}{
-			"name":  "REPO_URL",
-			"value": o.Spec.RepoURL,
+		{
+			Name:  "REPO_URL",
+			Value: o.Spec.RepoURL,
 		},
-		map[string]interface{}{
-			"name":  "OVERSEER_NAME",
-			"value": o.Name,
+		{
+			Name:  "OVERSEER_NAME",
+			Value: o.Name,
 		},
-		map[string]interface{}{
-			"name":  "NAMESPACE",
-			"value": namespace,
+		{
+			Name:  "NAMESPACE",
+			Value: namespace,
 		},
-		map[string]interface{}{
-			"name":  "HOME",
-			"value": "/workspaces/.home",
+		{
+			Name:  "HOME",
+			Value: "/workspaces/.home",
 		},
-
-		map[string]interface{}{
-			"name":  "POLL_INTERVAL",
-			"value": o.Spec.PollInterval,
+		{
+			Name:  "POLL_INTERVAL",
+			Value: o.Spec.PollInterval,
 		},
-		map[string]interface{}{
-			"name":  "EPHEMERAL_STORAGE",
-			"value": o.Spec.EphemeralStorage,
+		{
+			Name:  "ALLOW_GEMINI_ORCHESTRATION",
+			Value: fmt.Sprintf("%t", o.Spec.EnableGeminiOrchestrator),
 		},
-		map[string]interface{}{
-			"name":  "SANDBOX_CPU_REQUEST",
-			"value": o.Spec.SandboxCPURequest,
-		},
-		map[string]interface{}{
-			"name":  "SANDBOX_CPU_LIMIT",
-			"value": o.Spec.SandboxCPULimit,
-		},
-		map[string]interface{}{
-			"name":  "SANDBOX_MEMORY_REQUEST",
-			"value": o.Spec.SandboxMemoryRequest,
-		},
-		map[string]interface{}{
-			"name":  "SANDBOX_MEMORY_LIMIT",
-			"value": o.Spec.SandboxMemoryLimit,
-		},
-		map[string]interface{}{
-			"name":  "ALLOW_GEMINI_ORCHESTRATION",
-			"value": fmt.Sprintf("%t", o.Spec.EnableGeminiOrchestrator),
-		},
-		map[string]interface{}{
-			"name":  "COLLECTOR_URL",
-			"value": collectorURL(),
+		{
+			Name:  "COLLECTOR_URL",
+			Value: collectorURL(),
 		},
 	}
 
 	rolesJSON, _ := json.Marshal(o.Spec.Roles)
-	env = append(env, map[string]interface{}{
-		"name":  "FACTORY_ROLES",
-		"value": string(rolesJSON),
+	env = append(env, corev1.EnvVar{
+		Name:  "FACTORY_ROLES",
+		Value: string(rolesJSON),
 	})
 
 	if o.Spec.Chores != nil && o.Spec.Chores.Mode != "" {
-		env = append(env, map[string]interface{}{
-			"name":  "CHORES_MODE",
-			"value": o.Spec.Chores.Mode,
+		env = append(env, corev1.EnvVar{
+			Name:  "CHORES_MODE",
+			Value: o.Spec.Chores.Mode,
 		})
 	}
 
 	if o.Spec.Repo != nil {
 		if o.Spec.Repo.ReviewMode != "" {
-			env = append(env, map[string]interface{}{
-				"name":  "REVIEW_MODE",
-				"value": o.Spec.Repo.ReviewMode,
+			env = append(env, corev1.EnvVar{
+				Name:  "REVIEW_MODE",
+				Value: o.Spec.Repo.ReviewMode,
 			})
 		}
 		if o.Spec.Repo.PRMode != "" {
-			env = append(env, map[string]interface{}{
-				"name":  "PR_MODE",
-				"value": o.Spec.Repo.PRMode,
+			env = append(env, corev1.EnvVar{
+				Name:  "PR_MODE",
+				Value: o.Spec.Repo.PRMode,
 			})
 		}
 		if o.Spec.Repo.IssueMode != "" {
-			env = append(env, map[string]interface{}{
-				"name":  "ISSUE_MODE",
-				"value": o.Spec.Repo.IssueMode,
+			env = append(env, corev1.EnvVar{
+				Name:  "ISSUE_MODE",
+				Value: o.Spec.Repo.IssueMode,
 			})
 		}
 	}
 
 	if o.Spec.MaxActiveReviews != nil {
-		env = append(env, map[string]interface{}{
-			"name":  "MAX_ACTIVE_REVIEWS",
-			"value": fmt.Sprintf("%d", *o.Spec.MaxActiveReviews),
+		env = append(env, corev1.EnvVar{
+			Name:  "MAX_ACTIVE_REVIEWS",
+			Value: fmt.Sprintf("%d", *o.Spec.MaxActiveReviews),
 		})
 	}
 	if o.Spec.MaxActiveIssues != nil {
-		env = append(env, map[string]interface{}{
-			"name":  "MAX_ACTIVE_ISSUES",
-			"value": fmt.Sprintf("%d", *o.Spec.MaxActiveIssues),
+		env = append(env, corev1.EnvVar{
+			Name:  "MAX_ACTIVE_ISSUES",
+			Value: fmt.Sprintf("%d", *o.Spec.MaxActiveIssues),
 		})
 	}
 	if o.Spec.SandboxEvictionAge != "" {
-		env = append(env, map[string]interface{}{
-			"name":  "SANDBOX_EVICTION_AGE",
-			"value": o.Spec.SandboxEvictionAge,
+		env = append(env, corev1.EnvVar{
+			Name:  "SANDBOX_EVICTION_AGE",
+			Value: o.Spec.SandboxEvictionAge,
 		})
 	}
 	if o.Spec.SandboxIdleTimeout != "" {
-		env = append(env, map[string]interface{}{
-			"name":  "SANDBOX_IDLE_TIMEOUT",
-			"value": o.Spec.SandboxIdleTimeout,
+		env = append(env, corev1.EnvVar{
+			Name:  "SANDBOX_IDLE_TIMEOUT",
+			Value: o.Spec.SandboxIdleTimeout,
 		})
 	}
 	if o.Spec.PRInactivityTimeout != nil {
-		env = append(env, map[string]interface{}{
-			"name":  "PR_INACTIVITY_TIMEOUT",
-			"value": o.Spec.PRInactivityTimeout.Duration.String(),
+		env = append(env, corev1.EnvVar{
+			Name:  "PR_INACTIVITY_TIMEOUT",
+			Value: o.Spec.PRInactivityTimeout.Duration.String(),
 		})
 	}
 	if o.Spec.MinNumber != nil {
-		env = append(env, map[string]interface{}{
-			"name":  "MIN_NUMBER",
-			"value": fmt.Sprintf("%d", *o.Spec.MinNumber),
+		env = append(env, corev1.EnvVar{
+			Name:  "MIN_NUMBER",
+			Value: fmt.Sprintf("%d", *o.Spec.MinNumber),
 		})
 	}
-	if o.Spec.WorkspaceDiskSize != "" {
-		env = append(env, map[string]interface{}{
-			"name":  "WORKSPACE_DISK_SIZE",
-			"value": o.Spec.WorkspaceDiskSize,
+	if !o.Spec.WorkspaceDiskSize.IsZero() {
+		env = append(env, corev1.EnvVar{
+			Name:  "WORKSPACE_DISK_SIZE",
+			Value: o.Spec.WorkspaceDiskSize.String(),
+		})
+	}
+	if !o.Spec.EphemeralStorage.IsZero() {
+		env = append(env, corev1.EnvVar{
+			Name:  "EPHEMERAL_STORAGE",
+			Value: o.Spec.EphemeralStorage.String(),
+		})
+	}
+	if !o.Spec.SandboxCPURequest.IsZero() {
+		env = append(env, corev1.EnvVar{
+			Name:  "SANDBOX_CPU_REQUEST",
+			Value: o.Spec.SandboxCPURequest.String(),
+		})
+	}
+	if !o.Spec.SandboxCPULimit.IsZero() {
+		env = append(env, corev1.EnvVar{
+			Name:  "SANDBOX_CPU_LIMIT",
+			Value: o.Spec.SandboxCPULimit.String(),
+		})
+	}
+	if !o.Spec.SandboxMemoryRequest.IsZero() {
+		env = append(env, corev1.EnvVar{
+			Name:  "SANDBOX_MEMORY_REQUEST",
+			Value: o.Spec.SandboxMemoryRequest.String(),
+		})
+	}
+	if !o.Spec.SandboxMemoryLimit.IsZero() {
+		env = append(env, corev1.EnvVar{
+			Name:  "SANDBOX_MEMORY_LIMIT",
+			Value: o.Spec.SandboxMemoryLimit.String(),
 		})
 	}
 	if o.Spec.Image != "" {
-		env = append(env, map[string]interface{}{
-			"name":  "FACTORY_IMAGE",
-			"value": o.Spec.Image,
+		env = append(env, corev1.EnvVar{
+			Name:  "FACTORY_IMAGE",
+			Value: o.Spec.Image,
 		})
 	}
 	if len(o.Spec.Secrets) > 0 {
 		secretsJSON, err := json.Marshal(o.Spec.Secrets)
 		if err == nil {
-			env = append(env, map[string]interface{}{
-				"name":  "FACTORY_SECRETS",
-				"value": string(secretsJSON),
+			env = append(env, corev1.EnvVar{
+				Name:  "FACTORY_SECRETS",
+				Value: string(secretsJSON),
 			})
 		}
 	}
 	if len(o.Spec.Env) > 0 {
 		envJSON, err := json.Marshal(o.Spec.Env)
 		if err == nil {
-			env = append(env, map[string]interface{}{
-				"name":  "FACTORY_ENV",
-				"value": string(envJSON),
+			env = append(env, corev1.EnvVar{
+				Name:  "FACTORY_ENV",
+				Value: string(envJSON),
 			})
 		}
 	}
 
-	ephemeralStorage := o.Spec.EphemeralStorage
-	if ephemeralStorage == "" {
-		ephemeralStorage = "10Gi"
+	ephemeralQty := resource.MustParse("10Gi")
+	if !o.Spec.EphemeralStorage.IsZero() {
+		ephemeralQty = o.Spec.EphemeralStorage
 	}
 
-	diskSize := o.Spec.WorkspaceDiskSize
-	if diskSize == "" {
-		diskSize = "10Gi"
+	diskQty := resource.MustParse("10Gi")
+	if !o.Spec.WorkspaceDiskSize.IsZero() {
+		diskQty = o.Spec.WorkspaceDiskSize
 	}
 
-	podSpec := map[string]interface{}{
-		"serviceAccountName": "overseer",
-		"containers": []interface{}{
-			map[string]interface{}{
-				"name":    "overseer",
-				"image":   image,
-				"command": []interface{}{"/app/bootstrap.sh"},
-				"env":     env,
-				"resources": map[string]interface{}{
-					"requests": map[string]interface{}{
-						"cpu":               "1000m",
-						"memory":            "1Gi",
-						"ephemeral-storage": ephemeralStorage,
-					},
-					"limits": map[string]interface{}{
-						"cpu":               "2000m",
-						"memory":            "2Gi",
-						"ephemeral-storage": ephemeralStorage,
-					},
-				},
-				"volumeMounts": []interface{}{
-					map[string]interface{}{"name": "workspaces-pvc", "mountPath": "/workspaces"},
-				},
-			},
+	volumes := []corev1.Volume{}
+	volumeMounts := []corev1.VolumeMount{
+		{
+			Name:      "workspaces-pvc",
+			MountPath: "/workspaces",
 		},
 	}
+
 	if hasTokenScript {
-		// Define the volume
-		volume := map[string]interface{}{
-			"name": "tokenscript-vol",
-			"secret": map[string]interface{}{
-				"secretName":  "tokenscript",
-				"defaultMode": int64(0755),
+		mode := int32(0755)
+		volumes = append(volumes, corev1.Volume{
+			Name: "tokenscript-vol",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  "tokenscript",
+					DefaultMode: &mode,
+				},
 			},
-		}
-
-		var volumes []interface{}
-		if v, ok := podSpec["volumes"]; ok {
-			volumes = v.([]interface{})
-		}
-		volumes = append(volumes, volume)
-		podSpec["volumes"] = volumes
-
-		// Define the volumeMount
-		volumeMount := map[string]interface{}{
-			"name":      "tokenscript-vol",
-			"mountPath": "/etc/tokenscript",
-		}
-
-		containers := podSpec["containers"].([]interface{})
-		mainContainer := containers[0].(map[string]interface{})
-		var volumeMounts []interface{}
-		if vm, ok := mainContainer["volumeMounts"]; ok {
-			volumeMounts = vm.([]interface{})
-		}
-		volumeMounts = append(volumeMounts, volumeMount)
-		mainContainer["volumeMounts"] = volumeMounts
-
-		// Add an environment variable so overseer-cli knows where it is
-		envList := mainContainer["env"].([]interface{})
-		envList = append(envList, map[string]interface{}{
-			"name":  "TOKENSCRIPT_DIR",
-			"value": "/etc/tokenscript",
 		})
-		mainContainer["env"] = envList
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "tokenscript-vol",
+			MountPath: "/etc/tokenscript",
+		})
+		env = append(env, corev1.EnvVar{
+			Name:  "TOKENSCRIPT_DIR",
+			Value: "/etc/tokenscript",
+		})
 	}
 
 	// Inject CA cert volume
-	{
-		volume := map[string]interface{}{
-			"name": "ca-cert",
-			"secret": map[string]interface{}{
-				"secretName": "github-portal-ca",
-				"optional":   true,
+	volumes = append(volumes, corev1.Volume{
+		Name: "ca-cert",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: "github-portal-ca",
+				Optional:   ptr.To(true),
 			},
-		}
+		},
+	})
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name:      "ca-cert",
+		MountPath: "/etc/github-portal/ca",
+		ReadOnly:  true,
+	})
 
-		var volumes []interface{}
-		if v, ok := podSpec["volumes"]; ok {
-			volumes = v.([]interface{})
-		}
-		volumes = append(volumes, volume)
-		podSpec["volumes"] = volumes
-
-		volumeMount := map[string]interface{}{
-			"name":      "ca-cert",
-			"mountPath": "/etc/github-portal/ca",
-			"readOnly":  true,
-		}
-
-		containers := podSpec["containers"].([]interface{})
-		mainContainer := containers[0].(map[string]interface{})
-		var volumeMounts []interface{}
-		if vm, ok := mainContainer["volumeMounts"]; ok {
-			volumeMounts = vm.([]interface{})
-		}
-		volumeMounts = append(volumeMounts, volumeMount)
-		mainContainer["volumeMounts"] = volumeMounts
-	}
-
-	u := &unstructured.Unstructured{
-		Object: map[string]interface{}{
-			"apiVersion": "agents.x-k8s.io/v1alpha1",
-			"kind":       "Sandbox",
-			"metadata": map[string]interface{}{
-				"name":      name,
-				"namespace": namespace,
-				"labels": map[string]interface{}{
-					"sandbox-type":                        "agent",
-					"overseer.gemini.google.com/overseer": o.Name,
+	return &sandboxapi.Sandbox{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: sandboxapi.GroupVersion.String(),
+			Kind:       "Sandbox",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"sandbox-type":                        "agent",
+				"overseer.gemini.google.com/overseer": o.Name,
+			},
+		},
+		Spec: sandboxapi.SandboxSpec{
+			Replicas: ptr.To(int32(1)),
+			PodTemplate: sandboxapi.PodTemplate{
+				ObjectMeta: sandboxapi.PodMetadata{
+					Labels: map[string]string{
+						"sandbox":      name,
+						"sandbox-type": "agent",
+					},
 				},
-			},
-			"spec": map[string]interface{}{
-				"replicas": int64(1),
-				"podTemplate": map[string]interface{}{
-					"metadata": map[string]interface{}{
-						"labels": map[string]interface{}{
-							"sandbox":      name,
-							"sandbox-type": "agent",
+				Spec: corev1.PodSpec{
+					ServiceAccountName: "overseer",
+					Containers: []corev1.Container{
+						{
+							Name:    "overseer",
+							Image:   image,
+							Command: []string{"/app/bootstrap.sh"},
+							Env:     env,
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:              resource.MustParse("1000m"),
+									corev1.ResourceMemory:           resource.MustParse("1Gi"),
+									corev1.ResourceEphemeralStorage: ephemeralQty,
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:              resource.MustParse("2000m"),
+									corev1.ResourceMemory:           resource.MustParse("2Gi"),
+									corev1.ResourceEphemeralStorage: ephemeralQty,
+								},
+							},
+							VolumeMounts: volumeMounts,
 						},
 					},
-					"spec": podSpec,
+					Volumes: volumes,
 				},
-				"volumeClaimTemplates": []interface{}{
-					map[string]interface{}{
-						"metadata": map[string]interface{}{
-							"name": "workspaces-pvc",
+			},
+			VolumeClaimTemplates: []sandboxapi.PersistentVolumeClaimTemplate{
+				{
+					EmbeddedObjectMetadata: sandboxapi.EmbeddedObjectMetadata{
+						Name: "workspaces-pvc",
+					},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						AccessModes: []corev1.PersistentVolumeAccessMode{
+							corev1.ReadWriteOnce,
 						},
-						"spec": map[string]interface{}{
-							"accessModes": []interface{}{"ReadWriteOnce"},
-							"resources": map[string]interface{}{
-								"requests": map[string]interface{}{
-									"storage": diskSize,
-								},
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceStorage: diskQty,
 							},
 						},
 					},
@@ -484,6 +462,4 @@ func newOverseerSandboxFromOverseer(o *overseerv1alpha1.Overseer, name, namespac
 			},
 		},
 	}
-
-	return u
 }

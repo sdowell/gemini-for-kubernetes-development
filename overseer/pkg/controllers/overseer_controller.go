@@ -31,6 +31,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	sandboxapi "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+
 	overseerv1alpha1 "github.com/gke-labs/gemini-for-kubernetes-development/overseer/pkg/api/v1alpha1"
 	"github.com/gke-labs/gemini-for-kubernetes-development/overseer/pkg/overseer"
 )
@@ -503,5 +505,6 @@ func (r *OverseerReconciler) copySecret(ctx context.Context, name string, fromNa
 func (r *OverseerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&overseerv1alpha1.Overseer{}).
+		Owns(&sandboxapi.Sandbox{}).
 		Complete(r)
 }

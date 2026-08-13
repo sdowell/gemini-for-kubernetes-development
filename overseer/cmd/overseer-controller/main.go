@@ -31,6 +31,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	sandboxapi "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+
 	overseerv1alpha1 "github.com/gke-labs/gemini-for-kubernetes-development/overseer/pkg/api/v1alpha1"
 	"github.com/gke-labs/gemini-for-kubernetes-development/overseer/pkg/controllers"
 	//+kubebuilder:scaffold:imports
@@ -44,6 +46,7 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(overseerv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(sandboxapi.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
 }
 

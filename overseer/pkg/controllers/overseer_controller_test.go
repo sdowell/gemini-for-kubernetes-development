@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	sandboxapi "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -38,6 +39,7 @@ func setupTestScheme() *runtime.Scheme {
 	_ = clientgoscheme.AddToScheme(s)
 	_ = rbacv1.AddToScheme(s)
 	_ = overseerv1alpha1.AddToScheme(s)
+	_ = sandboxapi.AddToScheme(s)
 	return s
 }
 

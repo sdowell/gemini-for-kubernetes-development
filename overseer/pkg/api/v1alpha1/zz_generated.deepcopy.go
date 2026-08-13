@@ -121,6 +121,12 @@ func (in *OverseerSpec) DeepCopyInto(out *OverseerSpec) {
 		*out = new(RepoSpec)
 		**out = **in
 	}
+	out.WorkspaceDiskSize = in.WorkspaceDiskSize.DeepCopy()
+	out.EphemeralStorage = in.EphemeralStorage.DeepCopy()
+	out.SandboxCPURequest = in.SandboxCPURequest.DeepCopy()
+	out.SandboxCPULimit = in.SandboxCPULimit.DeepCopy()
+	out.SandboxMemoryRequest = in.SandboxMemoryRequest.DeepCopy()
+	out.SandboxMemoryLimit = in.SandboxMemoryLimit.DeepCopy()
 	in.Review.DeepCopyInto(&out.Review)
 	if in.MaxActiveReviews != nil {
 		in, out := &in.MaxActiveReviews, &out.MaxActiveReviews
