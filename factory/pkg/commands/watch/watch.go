@@ -20,22 +20,6 @@ import (
 	"k8s.io/klog/v2"
 )
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 func (w *Watcher) Run(ctx context.Context) error {
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -188,8 +172,6 @@ func (w *Watcher) Run(ctx context.Context) error {
 		}
 
 		now := time.Now()
-
-
 
 		// Determine what to run
 		runIssueScan := false
