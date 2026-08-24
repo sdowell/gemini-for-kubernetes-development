@@ -399,6 +399,39 @@ func TestIsPRTask(t *testing.T) {
 	}
 }
 
+func TestHasPendingOrProcessingTasksForPR(t *testing.T) {
+	incomingDir := t.TempDir()
+	procDir := t.TempDir()
+
+	if hasPendingOrProcessingTasksForPR(incomingDir, procDir, 100) {
+		t.Errorf("expected false when no tasks exist")
+	}
+
+	// 1. Task in incoming dir
+	f1 := filepath.Join(incomingDir, "task-pr-100-comments.yaml")
+	_ = os.WriteFile(f1, []byte(""), 0644)
+	if !hasPendingOrProcessingTasksForPR(incomingDir, procDir, 100) {
+		t.Errorf("expected true when task is in incoming dir")
+	}
+	if hasPendingOrProcessingTasksForPR(incomingDir, procDir, 200) {
+		t.Errorf("expected false for different PR number")
+	}
+
+	// 2. Move to processing dir
+	_ = os.Remove(f1)
+	f2 := filepath.Join(procDir, "task-pr-100-review.yaml")
+	_ = os.WriteFile(f2, []byte(""), 0644)
+	if !hasPendingOrProcessingTasksForPR(incomingDir, procDir, 100) {
+		t.Errorf("expected true when task is in processing dir")
+	}
+
+	// 3. Remove task
+	_ = os.Remove(f2)
+	if hasPendingOrProcessingTasksForPR(incomingDir, procDir, 100) {
+		t.Errorf("expected false after removing task")
+	}
+}
+
 func TestLoadProcessedTasks(t *testing.T) {
 	dir := t.TempDir()
 

@@ -314,6 +314,25 @@ func removePendingTasksForNumber(incomingDir string, number int) {
 	}
 }
 
+func hasPendingOrProcessingTasksForPR(incomingDir, processingDir string, number int) bool {
+	pattern := fmt.Sprintf("-pr-%d-", number)
+	for _, dir := range []string{incomingDir, processingDir} {
+		if dir == "" {
+			continue
+		}
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if !f.IsDir() && strings.Contains(f.Name(), pattern) && strings.HasSuffix(f.Name(), ".yaml") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func isPRTask(taskType string) bool {
 	return taskType == "pr-investigate" || taskType == "pr-comments" || taskType == "pr-iterate"
 }

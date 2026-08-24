@@ -621,12 +621,14 @@ func (w *Watcher) processPRs(ctx context.Context, prIssues []*githubv39.Issue) {
 			// Check and reconcile ready-for-human label
 			if listReviewsErr == nil {
 				isReviewRequired := shouldAutoReviewPR(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, pr, prIssue, w.triggerLabel)
-				hasBotReviewOnHead := hasCompletedBotReviewOnHead(reviews, headSHA, lastCommitTime, w.cfg)
+				hasBotReviewOnHead := hasCompletedBotReviewOnHead(reviews, revCommentsMap, headSHA, lastCommitTime, w.cfg)
 				reviewSatisfied := !isReviewRequired || hasBotReviewOnHead
+				hasActiveTasks := hasPendingOrProcessingTasksForPR(w.incomingDir, w.processingDir, num)
 
 				isReadyForHuman := !isConflicting &&
 					!hasFailure &&
 					!hasNewComments &&
+					!hasActiveTasks &&
 					reviewSatisfied &&
 					!hasStopLabel(prIssue.Labels, w.triggerLabel) &&
 					!pr.GetDraft() &&

@@ -347,7 +347,7 @@ func hasReadyForHumanLabel(labels []*githubv39.Label, triggerLabel string) bool 
 	return false
 }
 
-func hasCompletedBotReviewOnHead(reviews []*githubv39.PullRequestReview, headSHA string, lastCommitTime time.Time, cfg *config.FactoryConfig) bool {
+func hasCompletedBotReviewOnHead(reviews []*githubv39.PullRequestReview, revComments map[int64][]*githubv39.PullRequestComment, headSHA string, lastCommitTime time.Time, cfg *config.FactoryConfig) bool {
 	var latestReview *githubv39.PullRequestReview
 	for _, r := range reviews {
 		if isReviewerBot(r.GetUser(), cfg) && (r.GetSubmittedAt().After(lastCommitTime) || r.GetCommitID() == headSHA) {
@@ -359,7 +359,15 @@ func hasCompletedBotReviewOnHead(reviews []*githubv39.PullRequestReview, headSHA
 	if latestReview == nil {
 		return false
 	}
-	return latestReview.GetState() != "CHANGES_REQUESTED"
+	if latestReview.GetState() == "CHANGES_REQUESTED" {
+		return false
+	}
+	if revComments != nil {
+		if comments, ok := revComments[latestReview.GetID()]; ok && len(comments) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (w *Watcher) reconcileReadyForHumanLabel(ctx context.Context, num int, prIssue *githubv39.Issue, isReady bool, headSHA string) {

@@ -104,11 +104,12 @@ Once a PR successfully passes automated code review by the reviewer bot, the fac
 
 ### A. Ready Conditions
 The label is applied when all of the following conditions are met:
-1. **Review Completed on HEAD (if enabled)**: If automated bot review is opted in via `overseer/review` (or inherited from parent issue), a configured reviewer bot must have completed its review on the latest `headSHA`. If automated review is not enabled, this prerequisite is automatically satisfied.
-2. **Review Passed**: The latest review from the reviewer bot is not `CHANGES_REQUESTED` and all review feedback has been resolved (`!hasNewComments`).
-3. **Passing CI Checks**: All GitHub check runs and commit statuses for `headSHA` are green (`!hasFailure`).
-4. **Mergeable**: No merge conflicts or pending rebases (`!isConflicting`).
-5. **Active & Open**: PR is open, not in draft mode, and not stopped (`!hasStopLabel`).
+1. **Review Completed on HEAD (if enabled)**: If automated bot review is opted in via `overseer/review` (or inherited from parent issue), a configured reviewer bot must have completed its review on the latest `headSHA` with **zero inline review comments** and state other than `CHANGES_REQUESTED`. If automated review is not enabled, this prerequisite is automatically satisfied.
+2. **Review Passed & Comments Addressed**: All human and bot review comments have been resolved (`!hasNewComments`).
+3. **No Active Tasks**: There are no pending or in-flight tasks in `incoming/`, `processing/`, or running sandboxes for this PR (`!hasActiveTasks`).
+4. **Passing CI Checks**: All GitHub check runs and commit statuses for `headSHA` are green (`!hasFailure`).
+5. **Mergeable**: No merge conflicts or pending rebases (`!isConflicting`).
+6. **Active & Open**: PR is open, not in draft mode, and not stopped (`!hasStopLabel`).
 
 ### B. Invalidation & Removal
 The label is automatically removed if any condition ceases to hold (e.g. new commits pushed, new comments added, CI check failures, or merge conflicts), ensuring humans only review PRs that currently pass all automated criteria.

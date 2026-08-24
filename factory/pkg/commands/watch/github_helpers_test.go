@@ -544,22 +544,27 @@ func TestHasCompletedBotReviewOnHead(t *testing.T) {
 	commitTime := now.Add(-10 * time.Minute)
 	headSHA := "abc1234"
 
-	// 1. Review after last commit with COMMENTED
+	// 1. Review after last commit with COMMENTED and 0 inline comments
 	reviews1 := []*githubv39.PullRequestReview{
 		{
+			ID:          int64Ptr(101),
 			User:        &githubv39.User{Login: stringPtr("custom-reviewbot")},
 			SubmittedAt: &time.Time{},
 			State:       stringPtr("COMMENTED"),
 		},
 	}
 	*reviews1[0].SubmittedAt = now.Add(-5 * time.Minute)
-	if !hasCompletedBotReviewOnHead(reviews1, headSHA, commitTime, cfg) {
-		t.Errorf("expected hasCompletedBotReviewOnHead with recent review to be true")
+	revComments1 := map[int64][]*githubv39.PullRequestComment{
+		101: {},
+	}
+	if !hasCompletedBotReviewOnHead(reviews1, revComments1, headSHA, commitTime, cfg) {
+		t.Errorf("expected hasCompletedBotReviewOnHead with recent review and 0 comments to be true")
 	}
 
 	// 2. Review matching headSHA with APPROVED
 	reviews2 := []*githubv39.PullRequestReview{
 		{
+			ID:          int64Ptr(102),
 			User:        &githubv39.User{Login: stringPtr("reviewbot-robot")},
 			CommitID:    stringPtr("abc1234"),
 			SubmittedAt: &time.Time{},
@@ -567,13 +572,14 @@ func TestHasCompletedBotReviewOnHead(t *testing.T) {
 		},
 	}
 	*reviews2[0].SubmittedAt = now.Add(-15 * time.Minute)
-	if !hasCompletedBotReviewOnHead(reviews2, headSHA, commitTime, cfg) {
+	if !hasCompletedBotReviewOnHead(reviews2, nil, headSHA, commitTime, cfg) {
 		t.Errorf("expected hasCompletedBotReviewOnHead with matching headSHA to be true")
 	}
 
 	// 3. Review with CHANGES_REQUESTED
 	reviews3 := []*githubv39.PullRequestReview{
 		{
+			ID:          int64Ptr(103),
 			User:        &githubv39.User{Login: stringPtr("custom-reviewbot")},
 			CommitID:    stringPtr("abc1234"),
 			SubmittedAt: &time.Time{},
@@ -581,13 +587,37 @@ func TestHasCompletedBotReviewOnHead(t *testing.T) {
 		},
 	}
 	*reviews3[0].SubmittedAt = now.Add(-5 * time.Minute)
-	if hasCompletedBotReviewOnHead(reviews3, headSHA, commitTime, cfg) {
+	if hasCompletedBotReviewOnHead(reviews3, nil, headSHA, commitTime, cfg) {
 		t.Errorf("expected hasCompletedBotReviewOnHead with CHANGES_REQUESTED to be false")
 	}
 
-	// 4. Review by non-reviewer bot
+	// 4. Review with COMMENTED but has inline review comments (issues to fix)
+	reviews4Inline := []*githubv39.PullRequestReview{
+		{
+			ID:          int64Ptr(104),
+			User:        &githubv39.User{Login: stringPtr("custom-reviewbot")},
+			CommitID:    stringPtr("abc1234"),
+			SubmittedAt: &time.Time{},
+			State:       stringPtr("COMMENTED"),
+		},
+	}
+	*reviews4Inline[0].SubmittedAt = now.Add(-5 * time.Minute)
+	revComments4 := map[int64][]*githubv39.PullRequestComment{
+		104: {
+			{
+				ID:   int64Ptr(201),
+				Body: stringPtr("Please fix this model fallback"),
+			},
+		},
+	}
+	if hasCompletedBotReviewOnHead(reviews4Inline, revComments4, headSHA, commitTime, cfg) {
+		t.Errorf("expected hasCompletedBotReviewOnHead with inline comments to be false")
+	}
+
+	// 5. Review by non-reviewer bot
 	reviews4 := []*githubv39.PullRequestReview{
 		{
+			ID:          int64Ptr(105),
 			User:        &githubv39.User{Login: stringPtr("coder-bot")},
 			CommitID:    stringPtr("abc1234"),
 			SubmittedAt: &time.Time{},
@@ -595,13 +625,14 @@ func TestHasCompletedBotReviewOnHead(t *testing.T) {
 		},
 	}
 	*reviews4[0].SubmittedAt = now.Add(-5 * time.Minute)
-	if hasCompletedBotReviewOnHead(reviews4, headSHA, commitTime, cfg) {
+	if hasCompletedBotReviewOnHead(reviews4, nil, headSHA, commitTime, cfg) {
 		t.Errorf("expected hasCompletedBotReviewOnHead with non-reviewer bot to be false")
 	}
 
-	// 5. Review before last commit and differing SHA
+	// 6. Review before last commit and differing SHA
 	reviews5 := []*githubv39.PullRequestReview{
 		{
+			ID:          int64Ptr(106),
 			User:        &githubv39.User{Login: stringPtr("custom-reviewbot")},
 			CommitID:    stringPtr("oldsha123"),
 			SubmittedAt: &time.Time{},
@@ -609,29 +640,40 @@ func TestHasCompletedBotReviewOnHead(t *testing.T) {
 		},
 	}
 	*reviews5[0].SubmittedAt = now.Add(-20 * time.Minute)
-	if hasCompletedBotReviewOnHead(reviews5, headSHA, commitTime, cfg) {
+	if hasCompletedBotReviewOnHead(reviews5, nil, headSHA, commitTime, cfg) {
 		t.Errorf("expected hasCompletedBotReviewOnHead with stale review on old SHA to be false")
 	}
 
-	// 6. Multiple reviews: first CHANGES_REQUESTED, later COMMENTED/APPROVED
+	// 7. Multiple reviews: first had inline comments, newer review has 0 comments
 	reviews6 := []*githubv39.PullRequestReview{
 		{
+			ID:          int64Ptr(107),
 			User:        &githubv39.User{Login: stringPtr("custom-reviewbot")},
 			CommitID:    stringPtr("abc1234"),
 			SubmittedAt: &time.Time{},
-			State:       stringPtr("CHANGES_REQUESTED"),
+			State:       stringPtr("COMMENTED"),
 		},
 		{
+			ID:          int64Ptr(108),
 			User:        &githubv39.User{Login: stringPtr("custom-reviewbot")},
 			CommitID:    stringPtr("abc1234"),
 			SubmittedAt: &time.Time{},
-			State:       stringPtr("APPROVED"),
+			State:       stringPtr("COMMENTED"),
 		},
 	}
 	*reviews6[0].SubmittedAt = now.Add(-10 * time.Minute)
 	*reviews6[1].SubmittedAt = now.Add(-2 * time.Minute)
-	if !hasCompletedBotReviewOnHead(reviews6, headSHA, commitTime, cfg) {
-		t.Errorf("expected hasCompletedBotReviewOnHead with latest APPROVED to be true")
+	revComments6 := map[int64][]*githubv39.PullRequestComment{
+		107: {
+			{
+				ID:   int64Ptr(202),
+				Body: stringPtr("First review finding"),
+			},
+		},
+		108: {}, // Newer review has 0 comments
+	}
+	if !hasCompletedBotReviewOnHead(reviews6, revComments6, headSHA, commitTime, cfg) {
+		t.Errorf("expected hasCompletedBotReviewOnHead with latest review having 0 comments to be true")
 	}
 }
 
