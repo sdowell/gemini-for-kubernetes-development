@@ -836,3 +836,104 @@ func TestReconcileReadyForHumanLabel(t *testing.T) {
 		})
 	}
 }
+
+func TestHasDuplicateRecentComment(t *testing.T) {
+	tests := []struct {
+		name      string
+		comments  []*githubv39.IssueComment
+		checkBody string
+		bots      []string
+		selfLogin string
+		expected  bool
+	}{
+		{
+			name:      "Empty comments returns false",
+			comments:  nil,
+			checkBody: "🤖 AI Factory started resolving merge conflicts / rebasing this pull request in a sandbox.",
+			expected:  false,
+		},
+		{
+			name: "Latest comment matches target body",
+			comments: []*githubv39.IssueComment{
+				{
+					User: &githubv39.User{Login: stringPtr("spock-watcher-bot")},
+					Body: stringPtr("🤖 AI Factory started resolving merge conflicts / rebasing this pull request in a sandbox."),
+				},
+			},
+			checkBody: "🤖 AI Factory started resolving merge conflicts / rebasing this pull request in a sandbox.",
+			bots:      []string{"spock-watcher-bot"},
+			selfLogin: "spock-watcher-bot",
+			expected:  true,
+		},
+		{
+			name: "Latest comment is human after bot comment returns false",
+			comments: []*githubv39.IssueComment{
+				{
+					User: &githubv39.User{Login: stringPtr("spock-watcher-bot")},
+					Body: stringPtr("🤖 AI Factory started resolving merge conflicts / rebasing this pull request in a sandbox."),
+				},
+				{
+					User: &githubv39.User{Login: stringPtr("human-dev")},
+					Body: stringPtr("Please retry the rebase."),
+				},
+			},
+			checkBody: "🤖 AI Factory started resolving merge conflicts / rebasing this pull request in a sandbox.",
+			bots:      []string{"spock-watcher-bot"},
+			selfLogin: "spock-watcher-bot",
+			expected:  false,
+		},
+		{
+			name: "Bot comment followed by another bot comment matches returns true",
+			comments: []*githubv39.IssueComment{
+				{
+					User: &githubv39.User{Login: stringPtr("spock-watcher-bot")},
+					Body: stringPtr("🤖 AI Factory started resolving merge conflicts / rebasing this pull request in a sandbox."),
+				},
+				{
+					User: &githubv39.User{Login: stringPtr("ci-bot")},
+					Body: stringPtr("Build failed"),
+				},
+			},
+			checkBody: "🤖 AI Factory started resolving merge conflicts / rebasing this pull request in a sandbox.",
+			bots:      []string{"spock-watcher-bot", "ci-bot"},
+			selfLogin: "spock-watcher-bot",
+			expected:  true,
+		},
+		{
+			name: "Different body returns false",
+			comments: []*githubv39.IssueComment{
+				{
+					User: &githubv39.User{Login: stringPtr("spock-watcher-bot")},
+					Body: stringPtr("🤖 AI Factory started reviewing this pull request in a sandbox."),
+				},
+			},
+			checkBody: "🤖 AI Factory started resolving merge conflicts / rebasing this pull request in a sandbox.",
+			bots:      []string{"spock-watcher-bot"},
+			selfLogin: "spock-watcher-bot",
+			expected:  false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/comments") {
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(tc.comments)
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer server.Close()
+
+			ghClient := githubv39.NewClient(nil)
+			baseURL, _ := url.Parse(server.URL + "/")
+			ghClient.BaseURL = baseURL
+
+			got := hasDuplicateRecentComment(context.Background(), ghClient, "owner", "repo", 1, tc.checkBody, tc.bots, tc.selfLogin)
+			if got != tc.expected {
+				t.Errorf("hasDuplicateRecentComment() = %v, want %v", got, tc.expected)
+			}
+		})
+	}
+}

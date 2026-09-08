@@ -537,6 +537,19 @@ func (w *Watcher) handlePRIterate(ctx context.Context, pc *prContext) {
 	}
 
 	filename := fmt.Sprintf("task-pr-%d-iterate.yaml", num)
+	if w.processedDir != "" {
+		processedPath := filepath.Join(w.processedDir, filename)
+		if data, err := os.ReadFile(processedPath); err == nil {
+			var prevTask api.QueueTask
+			if err := yaml.Unmarshal(data, &prevTask); err == nil {
+				if prevTask.CommitSHA == pc.headSHA {
+					klog.Infof("Skipping PR #%d rebase/conflict resolution because an iterate task was already processed on disk for head SHA %s.", num, pc.headSHA)
+					return
+				}
+			}
+		}
+	}
+
 	if !taskExists(w.incomingDir, w.processingDir, filename) {
 		sandboxName := w.resolveSandboxName(ctx, api.TypePRIterate, num)
 		running, err := isSandboxTaskRunning(ctx, w.kubeClient, w.Namespace, sandboxName)

@@ -101,23 +101,8 @@ func (w *Watcher) runSingleTask(ctx context.Context, taskFilename string, t *api
 			}
 		}
 
-		if t.Type != api.TypeAgentChore {
-			var commentBody string
-			switch t.Type {
-			case api.TypeIssueFix:
-				commentBody = "🤖 AI Factory started fixing this issue in a sandbox."
-			case api.TypePRInvestigate:
-				commentBody = "🤖 AI Factory started investigating CI check failures for this pull request."
-			case api.TypePRComments:
-				commentBody = "🤖 AI Factory started addressing review feedback for this pull request."
-			case api.TypePRIterate:
-				commentBody = "🤖 AI Factory started resolving merge conflicts / rebasing this pull request in a sandbox."
-			case api.TypePRReview:
-				commentBody = "🤖 AI Factory started reviewing this pull request in a sandbox."
-			}
-			if commentBody != "" {
-				addGitHubComment(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, t.Number, commentBody)
-			}
+		if shouldComment, commentBody := w.shouldPostStartComment(ctx, t, taskFilename); shouldComment {
+			addGitHubComment(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, t.Number, commentBody)
 		}
 	}
 
@@ -405,3 +390,48 @@ func (w *Watcher) runTasks(ctx context.Context) {
 func parseTaskYAML(data []byte, t *api.QueueTask) error {
 	return yaml.Unmarshal(data, t)
 }
+
+func (w *Watcher) shouldPostStartComment(ctx context.Context, t *api.QueueTask, taskFilename string) (bool, string) {
+	if t.Type == api.TypeAgentChore {
+		return false, ""
+	}
+	var commentBody string
+	switch t.Type {
+	case api.TypeIssueFix:
+		commentBody = "🤖 AI Factory started fixing this issue in a sandbox."
+	case api.TypePRInvestigate:
+		commentBody = "🤖 AI Factory started investigating CI check failures for this pull request."
+	case api.TypePRComments:
+		commentBody = "🤖 AI Factory started addressing review feedback for this pull request."
+	case api.TypePRIterate:
+		commentBody = "🤖 AI Factory started resolving merge conflicts / rebasing this pull request in a sandbox."
+	case api.TypePRReview:
+		commentBody = "🤖 AI Factory started reviewing this pull request in a sandbox."
+	}
+	if commentBody == "" {
+		return false, ""
+	}
+
+	if t.CommitSHA != "" && w.processedDir != "" {
+		processedPath := filepath.Join(w.processedDir, taskFilename)
+		if data, err := os.ReadFile(processedPath); err == nil {
+			var prevTask api.QueueTask
+			if err := yaml.Unmarshal(data, &prevTask); err == nil {
+				if prevTask.CommitSHA == t.CommitSHA {
+					klog.Infof("Skipping start comment for task %s on #%d: task was already processed for commit %s", taskFilename, t.Number, t.CommitSHA)
+					return false, commentBody
+				}
+			}
+		}
+	}
+	var bots []string
+	if w.cfg != nil {
+		bots = w.cfg.AllowlistedBots
+	}
+	if hasDuplicateRecentComment(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, t.Number, commentBody, bots, w.githubLogin) {
+		klog.Infof("Skipping duplicate start comment on #%d as it matches the latest bot comment", t.Number)
+		return false, commentBody
+	}
+	return true, commentBody
+}
+

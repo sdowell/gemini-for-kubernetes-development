@@ -107,6 +107,29 @@ function setupGitRepos {
     echo "running gh repo fork"
     (cd "/workspaces/${REPO_NAME}" && gh repo fork --remote || true)
 
+    local GH_USER="${GITHUB_USER_ID}"
+    if [ -n "${GITHUB_BOT_LOGIN}" ]; then
+        GH_USER="${GITHUB_BOT_LOGIN}"
+    fi
+
+    # Ensure 'origin' points to the current user's fork, and 'upstream' points to CLONE_URL
+    if [ -n "${GH_USER}" ]; then
+        local USER_FORK_URL="https://github.com/${GH_USER}/${REPO_NAME}.git"
+        if (cd "/workspaces/${REPO_NAME}" && git remote | grep -q "^origin$"); then
+            (cd "/workspaces/${REPO_NAME}" && git remote set-url origin "${USER_FORK_URL}")
+        else
+            (cd "/workspaces/${REPO_NAME}" && git remote add origin "${USER_FORK_URL}" 2>/dev/null || true)
+        fi
+    fi
+
+    if [ -n "${CLONE_URL}" ]; then
+        if (cd "/workspaces/${REPO_NAME}" && git remote | grep -q "^upstream$"); then
+            (cd "/workspaces/${REPO_NAME}" && git remote set-url upstream "${CLONE_URL}")
+        else
+            (cd "/workspaces/${REPO_NAME}" && git remote add upstream "${CLONE_URL}" 2>/dev/null || true)
+        fi
+    fi
+
     echo "running gh repo set-default"
     (cd "/workspaces/${REPO_NAME}" && gh repo set-default "${CLONE_URL}" || true)
 }

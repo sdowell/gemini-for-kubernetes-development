@@ -113,6 +113,21 @@ completedAt: "2026-07-23T20:00:00Z"
 	if !state.lastCommentAddressedTime.Equal(expectedCommentTime) {
 		t.Errorf("expected lastCommentAddressedTime to remain unchanged when task is Failed, got %v", state.lastCommentAddressedTime)
 	}
+
+	// 6. Test that a Failed iterate task records lastIteratedSHA to prevent retry loops
+	failedIteratePath := filepath.Join(tempDir, "task-pr-123-iterate-failed.yaml")
+	failedIterateData := []byte(`
+type: pr-iterate
+status: Failed
+commitSHA: "failedsha789"
+completedAt: "2026-07-23T21:00:00Z"
+`)
+	_ = os.WriteFile(failedIteratePath, failedIterateData, 0644)
+	fInfoFailedIterate, _ := os.Stat(failedIteratePath)
+	state = parseProcessedPRTask(failedIteratePath, "task-pr-123-iterate", fInfoFailedIterate, state)
+	if state.lastIteratedSHA != "failedsha789" {
+		t.Errorf("expected lastIteratedSHA to be 'failedsha789' even when task is Failed, got '%s'", state.lastIteratedSHA)
+	}
 }
 
 func TestSortTasksFairly(t *testing.T) {

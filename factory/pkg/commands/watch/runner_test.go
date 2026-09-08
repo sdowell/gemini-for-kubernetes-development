@@ -1,11 +1,21 @@
 package watch
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/common"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/api"
+	githubv39 "github.com/google/go-github/v39/github"
+	"gopkg.in/yaml.v3"
 )
 
 func TestBuildTaskCommandArgs(t *testing.T) {
@@ -137,3 +147,166 @@ func TestBuildTaskCommandArgs(t *testing.T) {
 		}
 	})
 }
+
+func TestShouldPostStartComment(t *testing.T) {
+	expectedBody := "🤖 AI Factory started resolving merge conflicts / rebasing this pull request in a sandbox."
+
+	t.Run("Posts comment on fresh task", func(t *testing.T) {
+		tempDir := t.TempDir()
+		processedDir := filepath.Join(tempDir, "processed")
+		_ = os.MkdirAll(processedDir, 0755)
+
+		w := &Watcher{
+			processedDir: processedDir,
+			Flags: Flags{
+				Repo: RepoFlag{
+					Owner: "test-owner",
+					Repo:  "test-repo",
+				},
+			},
+			githubLogin: "bot",
+		}
+
+		task := &api.QueueTask{
+			Type:      api.TypePRIterate,
+			Number:    42,
+			CommitSHA: "abc1234",
+		}
+
+		shouldComment, body := w.shouldPostStartComment(context.Background(), task, "task-pr-42-iterate.yaml")
+		if !shouldComment {
+			t.Errorf("expected shouldComment=true for fresh task, got false")
+		}
+		if body != expectedBody {
+			t.Errorf("expected body %q, got %q", expectedBody, body)
+		}
+	})
+
+	t.Run("Suppresses comment when matching commit SHA exists in processedDir", func(t *testing.T) {
+		tempDir := t.TempDir()
+		processedDir := filepath.Join(tempDir, "processed")
+		_ = os.MkdirAll(processedDir, 0755)
+
+		prevTask := &api.QueueTask{
+			Type:      api.TypePRIterate,
+			Number:    42,
+			CommitSHA: "abc1234",
+			Status:    api.StatusFailed,
+		}
+		prevData, _ := yaml.Marshal(prevTask)
+		_ = os.WriteFile(filepath.Join(processedDir, "task-pr-42-iterate.yaml"), prevData, 0644)
+
+		w := &Watcher{
+			processedDir: processedDir,
+			Flags: Flags{
+				Repo: RepoFlag{
+					Owner: "test-owner",
+					Repo:  "test-repo",
+				},
+			},
+			githubLogin: "bot",
+		}
+
+		task := &api.QueueTask{
+			Type:      api.TypePRIterate,
+			Number:    42,
+			CommitSHA: "abc1234",
+		}
+
+		shouldComment, _ := w.shouldPostStartComment(context.Background(), task, "task-pr-42-iterate.yaml")
+		if shouldComment {
+			t.Errorf("expected shouldComment=false when commit SHA already in processedDir, got true")
+		}
+	})
+
+	t.Run("Allows comment when processedDir has different commit SHA", func(t *testing.T) {
+		tempDir := t.TempDir()
+		processedDir := filepath.Join(tempDir, "processed")
+		_ = os.MkdirAll(processedDir, 0755)
+
+		prevTask := &api.QueueTask{
+			Type:      api.TypePRIterate,
+			Number:    42,
+			CommitSHA: "old-sha-0000",
+			Status:    api.StatusCompleted,
+		}
+		prevData, _ := yaml.Marshal(prevTask)
+		_ = os.WriteFile(filepath.Join(processedDir, "task-pr-42-iterate.yaml"), prevData, 0644)
+
+		w := &Watcher{
+			processedDir: processedDir,
+			Flags: Flags{
+				Repo: RepoFlag{
+					Owner: "test-owner",
+					Repo:  "test-repo",
+				},
+			},
+			githubLogin: "bot",
+		}
+
+		task := &api.QueueTask{
+			Type:      api.TypePRIterate,
+			Number:    42,
+			CommitSHA: "new-sha-1111",
+		}
+
+		shouldComment, body := w.shouldPostStartComment(context.Background(), task, "task-pr-42-iterate.yaml")
+		if !shouldComment {
+			t.Errorf("expected shouldComment=true for new commit SHA, got false")
+		}
+		if body != expectedBody {
+			t.Errorf("expected body %q, got %q", expectedBody, body)
+		}
+	})
+
+	t.Run("Suppresses comment when GitHub already has duplicate recent comment", func(t *testing.T) {
+		tempDir := t.TempDir()
+		processedDir := filepath.Join(tempDir, "processed")
+		_ = os.MkdirAll(processedDir, 0755)
+
+		comments := []*githubv39.IssueComment{
+			{
+				User: &githubv39.User{Login: stringPtr("bot")},
+				Body: stringPtr(expectedBody),
+			},
+		}
+
+		server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/comments") {
+				rw.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(rw).Encode(comments)
+				return
+			}
+			http.NotFound(rw, r)
+		}))
+		defer server.Close()
+
+		ghClient := githubv39.NewClient(nil)
+		baseURL, _ := url.Parse(server.URL + "/")
+		ghClient.BaseURL = baseURL
+
+		w := &Watcher{
+			processedDir: processedDir,
+			Flags: Flags{
+				Repo: RepoFlag{
+					Owner: "test-owner",
+					Repo:  "test-repo",
+				},
+			},
+			ghClient:    ghClient,
+			githubLogin: "bot",
+		}
+
+		task := &api.QueueTask{
+			Type:      api.TypePRIterate,
+			Number:    42,
+			CommitSHA: "sha-different",
+		}
+
+		shouldComment, _ := w.shouldPostStartComment(context.Background(), task, "task-pr-42-iterate.yaml")
+		if shouldComment {
+			t.Errorf("expected shouldComment=false when duplicate comment exists on GitHub, got true")
+		}
+	})
+}
+

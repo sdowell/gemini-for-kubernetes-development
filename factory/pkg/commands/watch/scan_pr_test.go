@@ -3,6 +3,7 @@ package watch
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -875,5 +876,60 @@ func TestProcessPRs_CommentsPrioritizedOverCIFailures(t *testing.T) {
 
 	if _, err := os.Stat(commentsTaskFile); os.IsNotExist(err) {
 		t.Fatalf("expected task-pr-10-comments.yaml to be created when new comment arrives on a PR with previously investigated failing CI")
+	}
+}
+
+func TestHandlePRIterate_SkipsProcessedSHAOnDisk(t *testing.T) {
+	tempDir := t.TempDir()
+	incomingDir := filepath.Join(tempDir, "incoming")
+	processingDir := filepath.Join(tempDir, "processing")
+	processedDir := filepath.Join(tempDir, "processed")
+	_ = os.MkdirAll(incomingDir, 0755)
+	_ = os.MkdirAll(processingDir, 0755)
+	_ = os.MkdirAll(processedDir, 0755)
+
+	headSHA := "commit12345"
+	prNum := 42
+	filename := fmt.Sprintf("task-pr-%d-iterate.yaml", prNum)
+
+	// Write an existing processed task file with headSHA (even with status Failed)
+	processedTaskFile := filepath.Join(processedDir, filename)
+	processedTaskData := fmt.Appendf(nil, "type: pr-iterate\nnumber: %d\ncommitSHA: %s\nstatus: Failed\n", prNum, headSHA)
+	_ = os.WriteFile(processedTaskFile, processedTaskData, 0644)
+
+	w := &Watcher{
+		Flags: Flags{
+			Repo: RepoFlag{
+				Owner: "test-owner",
+				Repo:  "test-repo",
+			},
+			QueueDir: tempDir,
+		},
+		incomingDir:   incomingDir,
+		processingDir: processingDir,
+		processedDir:  processedDir,
+		processedPRs:  make(map[int]prWatchState),
+	}
+
+	prCtx := &prContext{
+		pr: &githubv39.PullRequest{
+			Number: &prNum,
+			Base:   &githubv39.PullRequestBranch{Ref: githubv39.String("main")},
+		},
+		prIssue: &githubv39.Issue{
+			Number: &prNum,
+		},
+		headSHA:        headSHA,
+		shortSHA:       headSHA[:7],
+		lastCommitTime: time.Now(),
+		taskAssignee:   "daedalus-agent-bot",
+		prURL:          "https://github.com/test-owner/test-repo/pull/42",
+	}
+
+	w.handlePRIterate(context.Background(), prCtx)
+
+	incomingTaskFile := filepath.Join(incomingDir, filename)
+	if _, err := os.Stat(incomingTaskFile); !os.IsNotExist(err) {
+		t.Fatalf("expected task-pr-%d-iterate.yaml NOT to be created in incomingDir because it was already processed on disk for headSHA", prNum)
 	}
 }

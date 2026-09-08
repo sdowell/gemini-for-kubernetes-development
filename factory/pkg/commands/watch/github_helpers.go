@@ -9,6 +9,7 @@ import (
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/common"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/api"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/config"
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/github"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/k8s"
 	githubv39 "github.com/google/go-github/v39/github"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,6 +35,30 @@ func addGitHubComment(ctx context.Context, client *githubv39.Client, owner, repo
 	if err != nil {
 		klog.Errorf("Failed to create GitHub comment on #%d: %v", number, err)
 	}
+}
+
+// hasDuplicateRecentComment checks if the most recent bot comment on the issue or PR
+// is already identical to the specified comment body without any intervening human comments.
+func hasDuplicateRecentComment(ctx context.Context, client *githubv39.Client, owner, repo string, number int, body string, bots []string, selfLogin string) bool {
+	if client == nil {
+		return false
+	}
+	comments, err := github.ListAllIssueComments(ctx, client, owner, repo, number)
+	if err != nil || len(comments) == 0 {
+		return false
+	}
+	targetBody := strings.TrimSpace(body)
+	for i := len(comments) - 1; i >= 0; i-- {
+		c := comments[i]
+		if strings.TrimSpace(c.GetBody()) == targetBody {
+			return true
+		}
+		// If a human comment was posted after the bot's comment, allow posting again
+		if !isBotReply(c.GetUser(), selfLogin, bots) {
+			break
+		}
+	}
+	return false
 }
 
 func listAllOpenPRs(ctx context.Context, ghClient *githubv39.Client, owner, repo string) ([]*githubv39.PullRequest, error) {

@@ -102,6 +102,29 @@ function setupGitRepos {
     echo "running gh repo fork"
     (cd "/workspaces/${REPO_NAME}" && gh repo fork --remote || true)
 
+    local GH_USER="${GITHUB_USER_ID}"
+    if [ -n "${GITHUB_BOT_LOGIN}" ]; then
+        GH_USER="${GITHUB_BOT_LOGIN}"
+    fi
+
+    # Ensure 'origin' points to the current user's fork, and 'upstream' points to CLONE_URL
+    if [ -n "${GH_USER}" ]; then
+        local USER_FORK_URL="https://github.com/${GH_USER}/${REPO_NAME}.git"
+        if (cd "/workspaces/${REPO_NAME}" && git remote | grep -q "^origin$"); then
+            (cd "/workspaces/${REPO_NAME}" && git remote set-url origin "${USER_FORK_URL}")
+        else
+            (cd "/workspaces/${REPO_NAME}" && git remote add origin "${USER_FORK_URL}" 2>/dev/null || true)
+        fi
+    fi
+
+    if [ -n "${CLONE_URL}" ]; then
+        if (cd "/workspaces/${REPO_NAME}" && git remote | grep -q "^upstream$"); then
+            (cd "/workspaces/${REPO_NAME}" && git remote set-url upstream "${CLONE_URL}")
+        else
+            (cd "/workspaces/${REPO_NAME}" && git remote add upstream "${CLONE_URL}" 2>/dev/null || true)
+        fi
+    fi
+
     echo "running gh repo set-default"
     (cd "/workspaces/${REPO_NAME}" && gh repo set-default "${CLONE_URL}" || true)
 }
@@ -324,11 +347,37 @@ function commitAndPush {
     
     NEW_HEAD=$(git rev-parse HEAD)
 
+    local GH_USER="${GITHUB_USER_ID}"
+    if [ -n "${GITHUB_BOT_LOGIN}" ]; then
+        GH_USER="${GITHUB_BOT_LOGIN}"
+    fi
+
+    local PUSH_REMOTE="origin"
+    local CURRENT_BRANCH
+    CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || true)
+    if [ -n "$CURRENT_BRANCH" ]; then
+        local TRACKING_REMOTE
+        TRACKING_REMOTE=$(git config branch."$CURRENT_BRANCH".remote 2>/dev/null || true)
+        if [ -n "$TRACKING_REMOTE" ]; then
+            local REMOTE_URL
+            REMOTE_URL=$(git remote get-url "$TRACKING_REMOTE" 2>/dev/null || true)
+            if [ "$TRACKING_REMOTE" = "origin" ] || [ -z "$GH_USER" ] || echo "$REMOTE_URL" | grep -qi "/${GH_USER}/"; then
+                PUSH_REMOTE="$TRACKING_REMOTE"
+            fi
+        fi
+    fi
+
+    local TARGET_BRANCH="${CURRENT_BRANCH:-$BRANCH_NAME}"
+    local PUSH_REF="HEAD"
+    if [ -n "$TARGET_BRANCH" ]; then
+        PUSH_REF="HEAD:${TARGET_BRANCH}"
+    fi
+
     # check if there are changes
     if [ -z "$(git status --porcelain)" ]; then 
         if [ "$OLD_HEAD" != "$NEW_HEAD" ]; then
-            echo "HEAD has changed (committed or rebased by agent). Pushing changes..."
-            git push --force origin HEAD
+            echo "HEAD has changed (committed or rebased by agent). Pushing changes to ${PUSH_REMOTE} (${PUSH_REF})..."
+            git push --force "$PUSH_REMOTE" "$PUSH_REF"
         else
             echo "No changes to commit."
         fi
@@ -337,10 +386,10 @@ function commitAndPush {
         git add .
         git commit -m "Address review feedback: Apply changes"
         if [ "$OLD_HEAD" != "$NEW_HEAD" ]; then
-            echo "HEAD has changed and working directory has changes. Pushing changes..."
-            git push --force origin HEAD
+            echo "HEAD has changed and working directory has changes. Pushing changes to ${PUSH_REMOTE} (${PUSH_REF})..."
+            git push --force "$PUSH_REMOTE" "$PUSH_REF"
         else
-            git push origin HEAD
+            git push "$PUSH_REMOTE" "$PUSH_REF"
         fi
     fi
     popd > /dev/null

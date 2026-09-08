@@ -267,6 +267,20 @@ func parseProcessedPRTask(filePath string, name string, fInfo os.FileInfo, state
 		if err := yaml.Unmarshal(data, &t); err == nil {
 			hasTask = true
 			if strings.EqualFold(string(t.Status), string(api.StatusFailed)) {
+				// For iterate tasks, record lastIteratedSHA even if Failed so we do not
+				// repeatedly retry rebasing the exact same commit SHA across restarts.
+				if isIterate && t.CommitSHA != "" {
+					state.lastIteratedSHA = t.CommitSHA
+					if fInfo != nil {
+						tTime := fInfo.ModTime()
+						if !t.CompletedAt.IsZero() {
+							tTime = t.CompletedAt
+						}
+						if tTime.After(state.lastIteratedTime) {
+							state.lastIteratedTime = tTime
+						}
+					}
+				}
 				return state
 			}
 		}
