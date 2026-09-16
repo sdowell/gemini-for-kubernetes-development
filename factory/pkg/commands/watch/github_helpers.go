@@ -9,6 +9,7 @@ import (
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/common"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/api"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/config"
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/github"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/k8s"
 	githubv39 "github.com/google/go-github/v39/github"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -273,65 +274,19 @@ func isPRApprovedOrLGTM(pr *githubv39.PullRequest, prIssue *githubv39.Issue, rev
 }
 
 func isReviewerBot(user *githubv39.User, cfg *config.FactoryConfig) bool {
-	if user == nil {
-		return false
-	}
-	login := user.GetLogin()
-	if cfg != nil {
-		if reviewerRole, ok := cfg.Roles["reviewer"]; ok {
-			for _, u := range reviewerRole.Users {
-				if strings.EqualFold(login, u) {
-					return true
-				}
-			}
-		}
-	}
-	return strings.Contains(strings.ToLower(login), "reviewbot")
+	return common.IsReviewerBot(user, cfg)
 }
 
 func isBotReply(user *githubv39.User, githubLogin string, allowlistedBots []string) bool {
-	if user == nil {
-		return false
-	}
-	login := user.GetLogin()
-	if strings.EqualFold(login, githubLogin) {
-		return true
-	}
-	for _, b := range allowlistedBots {
-		if strings.EqualFold(login, b) {
-			return true
-		}
-	}
-	return shouldIgnoreUser(user, githubLogin, nil)
+	return common.IsBotReply(user, githubLogin, allowlistedBots)
 }
 
 func shouldIgnoreUser(user *githubv39.User, githubLogin string, allowlistedBots []string) bool {
-	if user == nil {
-		return false
-	}
-	login := user.GetLogin()
-	if strings.EqualFold(login, githubLogin) {
-		return true // always ignore our own bot
-	}
+	return common.ShouldIgnoreUser(user, githubLogin, allowlistedBots)
+}
 
-	loginLower := strings.ToLower(login)
-	isBotUser := strings.EqualFold(user.GetType(), "Bot") ||
-		strings.HasSuffix(loginLower, "[bot]") ||
-		strings.HasSuffix(loginLower, "-bot") ||
-		strings.HasSuffix(loginLower, "-robot") ||
-		strings.Contains(loginLower, "prow")
-
-	if isBotUser {
-		// Check if it's in the allowlist
-		for _, b := range allowlistedBots {
-			if strings.EqualFold(login, b) {
-				return false // DO NOT ignore (it is allowlisted)
-			}
-		}
-		return true // ignore since it is not allowlisted
-	}
-
-	return false
+func isSystemOrInvestigateComment(body string) bool {
+	return common.IsSystemOrInvestigateComment(body)
 }
 
 func hasStopLabel(labels []*githubv39.Label, triggerLabel string) bool {
@@ -352,11 +307,13 @@ func hasStopLabel(labels []*githubv39.Label, triggerLabel string) bool {
 func getInvestigationCount(comments []*githubv39.IssueComment, lastCommitTime time.Time, allBotUsers []string, githubLogin string, bots []string, triggerLabel string) int {
 	lastResetTime := lastCommitTime
 	for _, c := range comments {
-		isPoolBot := false
-		for _, bot := range allBotUsers {
-			if strings.EqualFold(c.GetUser().GetLogin(), bot) {
-				isPoolBot = true
-				break
+		isPoolBot := strings.EqualFold(c.GetUser().GetLogin(), githubLogin)
+		if !isPoolBot {
+			for _, bot := range allBotUsers {
+				if strings.EqualFold(c.GetUser().GetLogin(), bot) {
+					isPoolBot = true
+					break
+				}
 			}
 		}
 		isHuman := !isPoolBot && !shouldIgnoreUser(c.GetUser(), githubLogin, bots)
@@ -370,11 +327,13 @@ func getInvestigationCount(comments []*githubv39.IssueComment, lastCommitTime ti
 
 	investigationCount := 0
 	for _, c := range comments {
-		isPoolBot := false
-		for _, bot := range allBotUsers {
-			if strings.EqualFold(c.GetUser().GetLogin(), bot) {
-				isPoolBot = true
-				break
+		isPoolBot := strings.EqualFold(c.GetUser().GetLogin(), githubLogin)
+		if !isPoolBot {
+			for _, bot := range allBotUsers {
+				if strings.EqualFold(c.GetUser().GetLogin(), bot) {
+					isPoolBot = true
+					break
+				}
 			}
 		}
 		if isPoolBot &&
@@ -384,6 +343,81 @@ func getInvestigationCount(comments []*githubv39.IssueComment, lastCommitTime ti
 		}
 	}
 	return investigationCount
+}
+
+func getAddressCommentsCount(
+	comments []*githubv39.IssueComment,
+	reviews []*githubv39.PullRequestReview,
+	revCommentsMap map[int64][]*githubv39.PullRequestComment,
+	lastCommitTime time.Time,
+	allBotUsers []string,
+	githubLogin string,
+	bots []string,
+	triggerLabel string,
+	cfg *config.FactoryConfig,
+) int {
+	lastResetTime := lastCommitTime
+	for _, c := range comments {
+		isPoolBot := strings.EqualFold(c.GetUser().GetLogin(), githubLogin)
+		if !isPoolBot {
+			for _, bot := range allBotUsers {
+				if strings.EqualFold(c.GetUser().GetLogin(), bot) {
+					isPoolBot = true
+					break
+				}
+			}
+		}
+		isReviewer := isReviewerBot(c.GetUser(), cfg)
+		isHuman := !isPoolBot && !shouldIgnoreUser(c.GetUser(), githubLogin, bots)
+		if (isHuman || isReviewer) && hasIgnorePrefix(c.GetBody(), triggerLabel) {
+			isHuman = false
+			isReviewer = false
+		}
+		isBotFeedbackReply := (isPoolBot || isBotReply(c.GetUser(), githubLogin, bots)) && !isReviewer && !isSystemOrInvestigateComment(c.GetBody())
+		if (isHuman || isReviewer || isBotFeedbackReply || strings.Contains(c.GetBody(), "pausing automated")) && c.GetCreatedAt().After(lastResetTime) {
+			lastResetTime = c.GetCreatedAt()
+		}
+	}
+
+	for _, r := range reviews {
+		isReviewer := isReviewerBot(r.GetUser(), cfg)
+		isHuman := !shouldIgnoreUser(r.GetUser(), githubLogin, bots)
+		if (isHuman || isReviewer) && !hasIgnorePrefix(r.GetBody(), triggerLabel) {
+			if r.GetSubmittedAt().After(lastResetTime) {
+				lastResetTime = r.GetSubmittedAt()
+			}
+		}
+		if revCommentsMap != nil {
+			for _, rc := range revCommentsMap[r.GetID()] {
+				isInlineReviewer := isReviewerBot(rc.GetUser(), cfg)
+				isInlineHuman := !shouldIgnoreUser(rc.GetUser(), githubLogin, bots)
+				if (isInlineHuman || isInlineReviewer) && !hasIgnorePrefix(rc.GetBody(), triggerLabel) {
+					if rc.GetCreatedAt().After(lastResetTime) {
+						lastResetTime = rc.GetCreatedAt()
+					}
+				}
+			}
+		}
+	}
+
+	addressCount := 0
+	for _, c := range comments {
+		isPoolBot := strings.EqualFold(c.GetUser().GetLogin(), githubLogin)
+		if !isPoolBot {
+			for _, bot := range allBotUsers {
+				if strings.EqualFold(c.GetUser().GetLogin(), bot) {
+					isPoolBot = true
+					break
+				}
+			}
+		}
+		if isPoolBot &&
+			strings.Contains(c.GetBody(), "started addressing review feedback") &&
+			c.GetCreatedAt().After(lastResetTime) {
+			addressCount++
+		}
+	}
+	return addressCount
 }
 
 func getStopLabel(triggerLabel string) string {
@@ -656,40 +690,42 @@ func (w *Watcher) selectUserForTask(ctx context.Context, taskType api.TaskType, 
 }
 
 func hasIssueCommentReaction(ctx context.Context, ghClient *githubv39.Client, owner, repo string, commentID int64, content string, filterBot bool, bots []string, selfLogin string) bool {
-	if ghClient == nil {
-		return false
-	}
-	reactions, _, err := ghClient.Reactions.ListIssueCommentReactions(ctx, owner, repo, commentID, nil)
-	if err != nil {
-		return false
-	}
-	for _, r := range reactions {
-		if r.GetContent() == content {
-			isBot := shouldIgnoreUser(r.GetUser(), selfLogin, bots)
-			if filterBot && isBot {
-				return true
-			} else if !filterBot && !isBot {
-				return true
-			}
-		}
-	}
-	return false
+	return common.HasIssueCommentReaction(ctx, ghClient, owner, repo, commentID, content, filterBot, bots, selfLogin)
+}
+
+func hasPullRequestCommentReaction(ctx context.Context, ghClient *githubv39.Client, owner, repo string, commentID int64, content string, filterBot bool, bots []string, selfLogin string) bool {
+	return common.HasPullRequestCommentReaction(ctx, ghClient, owner, repo, commentID, content, filterBot, bots, selfLogin)
 }
 
 func resolvePRCommentReactions(ctx context.Context, ghClient *githubv39.Client, owner, repo string, prNum int, resolutionContent string, bots []string, selfLogin string) {
 	if ghClient == nil {
 		return
 	}
-	comments, _, err := ghClient.Issues.ListComments(ctx, owner, repo, prNum, nil)
-	if err != nil {
-		return
-	}
-	for _, c := range comments {
-		if shouldIgnoreUser(c.GetUser(), selfLogin, bots) {
-			continue
+	comments, err := github.ListAllIssueComments(ctx, ghClient, owner, repo, prNum)
+	if err == nil {
+		for _, c := range comments {
+			if strings.EqualFold(c.GetUser().GetLogin(), selfLogin) {
+				continue
+			}
+			if hasIssueCommentReaction(ctx, ghClient, owner, repo, c.GetID(), "eyes", true, bots, selfLogin) {
+				addIssueCommentReaction(ctx, ghClient, owner, repo, c.GetID(), resolutionContent)
+			}
 		}
-		if hasIssueCommentReaction(ctx, ghClient, owner, repo, c.GetID(), "eyes", true, bots, selfLogin) {
-			addIssueCommentReaction(ctx, ghClient, owner, repo, c.GetID(), resolutionContent)
+	}
+	reviews, err := github.ListAllReviews(ctx, ghClient, owner, repo, prNum)
+	if err == nil {
+		for _, r := range reviews {
+			revComments, err := github.ListAllReviewComments(ctx, ghClient, owner, repo, prNum, r.GetID())
+			if err == nil {
+				for _, rc := range revComments {
+					if strings.EqualFold(rc.GetUser().GetLogin(), selfLogin) {
+						continue
+					}
+					if hasPullRequestCommentReaction(ctx, ghClient, owner, repo, rc.GetID(), "eyes", true, bots, selfLogin) {
+						addPullRequestCommentReaction(ctx, ghClient, owner, repo, rc.GetID(), resolutionContent)
+					}
+				}
+			}
 		}
 	}
 }
@@ -770,21 +806,6 @@ func hasInactivityComment(comments []*githubv39.IssueComment, lastActivity time.
 }
 
 // hasIgnorePrefix checks if any line of a comment body starts with the ignore prefix.
-// The prefix is constructed as "/" + triggerLabel + "-ignore".
-// If triggerLabel is empty or "overseer", we check for "/overseer-ignore".
-// Otherwise, we accept either "/overseer-ignore" or "/" + triggerLabel + "-ignore".
 func hasIgnorePrefix(body string, triggerLabel string) bool {
-	for _, line := range strings.Split(body, "\n") {
-		trimmed := strings.ToLower(strings.TrimSpace(line))
-		if strings.HasPrefix(trimmed, "/overseer-ignore") {
-			return true
-		}
-		if triggerLabel != "" && !strings.EqualFold(triggerLabel, "overseer") {
-			prefix := "/" + strings.ToLower(triggerLabel) + "-ignore"
-			if strings.HasPrefix(trimmed, prefix) {
-				return true
-			}
-		}
-	}
-	return false
+	return common.HasIgnorePrefix(body, triggerLabel)
 }

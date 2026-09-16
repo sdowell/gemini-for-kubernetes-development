@@ -242,7 +242,7 @@ func (w *Watcher) processPRs(ctx context.Context, prIssues []*githubv39.Issue) {
 		// Top level case statement for handling each type of PR task
 		switch {
 		case commentAnalysis.hasNewComments:
-			w.handlePRComments(ctx, pc, commentAnalysis)
+			w.handlePRComments(ctx, pc, commentAnalysis, comments, reviews, revCommentsMap, bots)
 
 		case isConflicting:
 			w.handlePRIterate(ctx, pc)
@@ -382,15 +382,36 @@ func (w *Watcher) evaluatePRComments(
 ) prCommentAnalysis {
 	var analysis prCommentAnalysis
 
-	// Find the latest timestamp of any reply made by an allowlisted bot user (excluding reviewer bots)
+	prevFailed := false
+	var failedTriggerTime time.Time
+	filename := fmt.Sprintf("task-pr-%d-comments.yaml", num)
+	if w.processedDir != "" {
+		processedPath := filepath.Join(w.processedDir, filename)
+		if data, err := os.ReadFile(processedPath); err == nil {
+			var t api.QueueTask
+			if err := yaml.Unmarshal(data, &t); err == nil {
+				if strings.EqualFold(string(t.Status), string(api.StatusFailed)) {
+					prevFailed = true
+					failedTriggerTime = t.TriggerEventTime
+				}
+			}
+		}
+	}
+
+	effectiveLastAddressed := lastCommentAddressedTime
+	if prevFailed {
+		effectiveLastAddressed = time.Time{}
+	}
+
+	// Find the latest timestamp of any reply made by an allowlisted bot user (excluding reviewer bots and system/investigate comments)
 	var latestBotReplyTime time.Time
 	for _, c := range comments {
-		if !isReviewerBot(c.GetUser(), w.cfg) && isBotReply(c.GetUser(), w.githubLogin, bots) && c.GetCreatedAt().After(latestBotReplyTime) {
+		if !isReviewerBot(c.GetUser(), w.cfg) && isBotReply(c.GetUser(), w.githubLogin, bots) && !isSystemOrInvestigateComment(c.GetBody()) && c.GetCreatedAt().After(latestBotReplyTime) {
 			latestBotReplyTime = c.GetCreatedAt()
 		}
 	}
 	for _, r := range reviews {
-		if !isReviewerBot(r.GetUser(), w.cfg) && isBotReply(r.GetUser(), w.githubLogin, bots) && r.GetSubmittedAt().After(latestBotReplyTime) {
+		if !isReviewerBot(r.GetUser(), w.cfg) && isBotReply(r.GetUser(), w.githubLogin, bots) && !isSystemOrInvestigateComment(r.GetBody()) && r.GetSubmittedAt().After(latestBotReplyTime) {
 			latestBotReplyTime = r.GetSubmittedAt()
 		}
 	}
@@ -418,17 +439,28 @@ func (w *Watcher) evaluatePRComments(
 		if hasIgnorePrefix(c.GetBody(), w.triggerLabel) {
 			continue
 		}
-		if c.GetCreatedAt().After(lastCommitTime) && c.GetCreatedAt().After(lastCommentAddressedTime) && c.GetCreatedAt().After(latestBotReplyTime) {
-			if hasIssueCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, c.GetID(), "+1", true, bots, w.githubLogin) {
+		humanRocket := hasIssueCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, c.GetID(), "rocket", false, bots, w.githubLogin)
+		if !humanRocket && hasIssueCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, c.GetID(), "+1", true, bots, w.githubLogin) {
+			continue
+		}
+		if !prevFailed && !humanRocket {
+			if hasIssueCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, c.GetID(), "eyes", true, bots, w.githubLogin) {
 				continue
 			}
-			humanRocket := hasIssueCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, c.GetID(), "rocket", false, bots, w.githubLogin)
-			if !humanRocket && hasIssueCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, c.GetID(), "eyes", true, bots, w.githubLogin) {
+			if hasIssueCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, c.GetID(), "confused", true, bots, w.githubLogin) {
 				continue
 			}
-			if !humanRocket && hasIssueCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, c.GetID(), "confused", true, bots, w.githubLogin) {
-				continue
-			}
+		}
+
+		hasUnaddressedReaction := humanRocket ||
+			(prevFailed && (hasIssueCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, c.GetID(), "eyes", true, bots, w.githubLogin) ||
+				hasIssueCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, c.GetID(), "confused", true, bots, w.githubLogin)) &&
+				c.GetCreatedAt().After(latestBotReplyTime))
+
+		isFromFailedTask := prevFailed && !failedTriggerTime.IsZero() && !c.GetCreatedAt().Before(failedTriggerTime) && c.GetCreatedAt().After(latestBotReplyTime)
+		isNewSinceCommit := c.GetCreatedAt().After(lastCommitTime) && c.GetCreatedAt().After(effectiveLastAddressed) && c.GetCreatedAt().After(latestBotReplyTime)
+
+		if hasUnaddressedReaction || isFromFailedTask || isNewSinceCommit {
 			if isReviewer {
 				hasNewBotReviews = true
 			} else {
@@ -447,7 +479,7 @@ func (w *Watcher) evaluatePRComments(
 	for _, r := range reviews {
 		isReviewer := isReviewerBot(r.GetUser(), w.cfg)
 		if !isReviewer && shouldIgnoreUser(r.GetUser(), w.githubLogin, bots) {
-			if r.GetSubmittedAt().After(latestBotReplyTime) {
+			if !isSystemOrInvestigateComment(r.GetBody()) && r.GetSubmittedAt().After(latestBotReplyTime) {
 				latestBotReplyTime = r.GetSubmittedAt()
 			}
 			continue
@@ -455,21 +487,26 @@ func (w *Watcher) evaluatePRComments(
 		if strings.EqualFold(r.GetUser().GetLogin(), pr.GetUser().GetLogin()) {
 			continue
 		}
-		if r.GetSubmittedAt().After(lastCommitTime) && r.GetSubmittedAt().After(lastCommentAddressedTime) && r.GetSubmittedAt().After(latestBotReplyTime) {
-			if hasIgnorePrefix(r.GetBody(), w.triggerLabel) {
-				continue
-			}
-			if isReviewer {
-				hasNewBotReviews = true
-			} else {
-				hasNewHumanComments = true
-			}
-			if strings.TrimSpace(r.GetBody()) != "" {
-				author := ""
-				if r.GetUser() != nil {
-					author = r.GetUser().GetLogin()
+
+		isReviewFromFailedTask := prevFailed && !failedTriggerTime.IsZero() && !r.GetSubmittedAt().Before(failedTriggerTime) && r.GetSubmittedAt().After(latestBotReplyTime)
+		isReviewNewSinceCommit := r.GetSubmittedAt().After(lastCommitTime) && r.GetSubmittedAt().After(effectiveLastAddressed) && r.GetSubmittedAt().After(latestBotReplyTime)
+
+		hasReviewBody := strings.TrimSpace(r.GetBody()) != ""
+		hasInlineComments := len(revCommentsMap[r.GetID()]) > 0
+		if (isReviewFromFailedTask || isReviewNewSinceCommit) && !hasIgnorePrefix(r.GetBody(), w.triggerLabel) {
+			if hasReviewBody || (!hasInlineComments && r.GetState() != "APPROVED") {
+				if isReviewer {
+					hasNewBotReviews = true
+				} else {
+					hasNewHumanComments = true
 				}
-				updateOldestComment(r.GetSubmittedAt(), author, "review", r.GetID())
+				if hasReviewBody {
+					author := ""
+					if r.GetUser() != nil {
+						author = r.GetUser().GetLogin()
+					}
+					updateOldestComment(r.GetSubmittedAt(), author, "review", r.GetID())
+				}
 			}
 		}
 
@@ -477,7 +514,7 @@ func (w *Watcher) evaluatePRComments(
 		for _, rc := range revComments {
 			isInlineReviewer := isReviewerBot(rc.GetUser(), w.cfg)
 			if !isInlineReviewer && shouldIgnoreUser(rc.GetUser(), w.githubLogin, bots) {
-				if rc.GetCreatedAt().After(latestBotReplyTime) {
+				if !isSystemOrInvestigateComment(rc.GetBody()) && rc.GetCreatedAt().After(latestBotReplyTime) {
 					latestBotReplyTime = rc.GetCreatedAt()
 				}
 				continue
@@ -485,10 +522,31 @@ func (w *Watcher) evaluatePRComments(
 			if strings.EqualFold(rc.GetUser().GetLogin(), pr.GetUser().GetLogin()) {
 				continue
 			}
-			if rc.GetCreatedAt().After(lastCommitTime) && rc.GetCreatedAt().After(lastCommentAddressedTime) && rc.GetCreatedAt().After(latestBotReplyTime) {
-				if hasIgnorePrefix(rc.GetBody(), w.triggerLabel) {
+			if hasIgnorePrefix(rc.GetBody(), w.triggerLabel) {
+				continue
+			}
+			humanRocket := hasPullRequestCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, rc.GetID(), "rocket", false, bots, w.githubLogin)
+			if !humanRocket && hasPullRequestCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, rc.GetID(), "+1", true, bots, w.githubLogin) {
+				continue
+			}
+			if !prevFailed && !humanRocket {
+				if hasPullRequestCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, rc.GetID(), "eyes", true, bots, w.githubLogin) {
 					continue
 				}
+				if hasPullRequestCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, rc.GetID(), "confused", true, bots, w.githubLogin) {
+					continue
+				}
+			}
+
+			hasUnaddressedReaction := humanRocket ||
+				(prevFailed && (hasPullRequestCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, rc.GetID(), "eyes", true, bots, w.githubLogin) ||
+					hasPullRequestCommentReaction(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, rc.GetID(), "confused", true, bots, w.githubLogin)) &&
+					rc.GetCreatedAt().After(latestBotReplyTime))
+
+			isRCFromFailedTask := prevFailed && !failedTriggerTime.IsZero() && !rc.GetCreatedAt().Before(failedTriggerTime) && rc.GetCreatedAt().After(latestBotReplyTime)
+			isRCNewSinceCommit := rc.GetCreatedAt().After(lastCommitTime) && rc.GetCreatedAt().After(effectiveLastAddressed) && rc.GetCreatedAt().After(latestBotReplyTime)
+
+			if hasUnaddressedReaction || isRCFromFailedTask || isRCNewSinceCommit {
 				if isInlineReviewer {
 					hasNewBotReviews = true
 				} else {
@@ -507,7 +565,7 @@ func (w *Watcher) evaluatePRComments(
 	if hasNewHumanComments {
 		analysis.hasNewComments = true
 	} else if hasNewBotReviews {
-		if lastCommentAddressedSHA != "" && lastCommentAddressedSHA == headSHA {
+		if !prevFailed && lastCommentAddressedSHA != "" && lastCommentAddressedSHA == headSHA {
 			klog.Infof("Skipping bot review feedback on PR #%d because an address-comments task already ran against SHA %s without resulting in a commit.", num, headSHA)
 		} else {
 			analysis.hasNewComments = true
@@ -641,6 +699,7 @@ func (w *Watcher) handlePRInvestigate(
 				if _, _, err := w.ghClient.Issues.AddLabelsToIssue(ctx, w.Repo.Owner, w.Repo.Repo, num, []string{stopLabel}); err != nil {
 					klog.Errorf("Failed to add stop label '%s' to PR #%d: %v", stopLabel, num, err)
 				}
+				pc.prIssue.Labels = append(pc.prIssue.Labels, &githubv39.Label{Name: githubv39.String(stopLabel)})
 			}
 			klog.Infof("Skipping PR #%d investigate because it has reached the maximum retry limit (3 attempts since last update) and applying stop label '%s'.", num, stopLabel)
 			return
@@ -709,7 +768,15 @@ func (w *Watcher) handlePRInvestigate(
 	}
 }
 
-func (w *Watcher) handlePRComments(ctx context.Context, pc *prContext, commentAnalysis prCommentAnalysis) {
+func (w *Watcher) handlePRComments(
+	ctx context.Context,
+	pc *prContext,
+	commentAnalysis prCommentAnalysis,
+	comments []*githubv39.IssueComment,
+	reviews []*githubv39.PullRequestReview,
+	revCommentsMap map[int64][]*githubv39.PullRequestComment,
+	bots []string,
+) {
 	if os.Getenv("DRY_RUN") == "true" {
 		return
 	}
@@ -718,6 +785,21 @@ func (w *Watcher) handlePRComments(ctx context.Context, pc *prContext, commentAn
 	filename := fmt.Sprintf("task-pr-%d-comments.yaml", num)
 
 	if !w.queueMgr.TaskExists(filename) {
+		addressCount := getAddressCommentsCount(comments, reviews, revCommentsMap, pc.lastCommitTime, w.allBotUsers, w.githubLogin, bots, w.triggerLabel, w.cfg)
+
+		if addressCount >= 3 {
+			stopLabel := getStopLabel(w.triggerLabel)
+			if !w.DryRun {
+				addGitHubComment(ctx, w.ghClient, w.Repo.Owner, w.Repo.Repo, num, fmt.Sprintf("🤖 AI Factory has attempted to address review feedback for this pull request 3 times since the last commit or update without success. To prevent infinite loops, I am pausing automated processing and attaching the `%s` label.\n\nTo request another attempt or resume automated processing, please remove the `%s` label from this pull request (and/or push a new commit or leave a comment).", stopLabel, stopLabel))
+				if _, _, err := w.ghClient.Issues.AddLabelsToIssue(ctx, w.Repo.Owner, w.Repo.Repo, num, []string{stopLabel}); err != nil {
+					klog.Errorf("Failed to add stop label '%s' to PR #%d: %v", stopLabel, num, err)
+				}
+				pc.prIssue.Labels = append(pc.prIssue.Labels, &githubv39.Label{Name: githubv39.String(stopLabel)})
+			}
+			klog.Infof("Skipping PR #%d address-comments because it has reached the maximum retry limit (3 attempts since last update) and applying stop label '%s'.", num, stopLabel)
+			return
+		}
+
 		sandboxName := w.sandboxes.ResolveName(ctx, api.TypePRComments, num)
 		running, err := w.sandboxes.IsTaskRunning(ctx, sandboxName)
 		if err != nil {

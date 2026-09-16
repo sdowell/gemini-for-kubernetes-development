@@ -308,6 +308,7 @@ type AddressCommentsFlags struct {
 	PRURL           string
 	Prompt          string
 	ContinueSession bool
+	Since           string
 }
 
 func NewAddressCommentsCommand(ctx context.Context) *cobra.Command {
@@ -349,18 +350,196 @@ func NewAddressCommentsCommand(ctx context.Context) *cobra.Command {
 
 			ctx, cancel := context.WithTimeout(ctx, rootFlags.Timeout)
 			defer cancel()
-			return runAddressComments(ctx, flags.PRURL, flags.Prompt, flags.ContinueSession, rootFlags.EphemeralStorage, rootFlags.ResolvedSecrets)
+			return runAddressComments(ctx, flags.PRURL, flags.Prompt, flags.ContinueSession, flags.Since, rootFlags.EphemeralStorage, rootFlags.ResolvedSecrets)
 		},
 	}
 
 	cmd.Flags().StringVar(&flags.PRURL, "pr-url", "", "GitHub PR URL (e.g. https://github.com/owner/repo/pull/123)")
 	cmd.Flags().StringVar(&flags.Prompt, "prompt", "Address review feedback for this PR", "Custom prompt for the address-comments task")
 	cmd.Flags().BoolVar(&flags.ContinueSession, "continue-session", false, "Continue the Gemini session from previous runs in the sandbox")
+	cmd.Flags().StringVar(&flags.Since, "since", "", "Optional timestamp (RFC3339) to consider unaddressed comments created at or after as new feedback")
 
 	return cmd
 }
 
-func runAddressComments(ctx context.Context, prURL, prompt string, continueSession bool, ephemeralStorage string, secrets []factorysandbox.SecretMount) error {
+func classifyPRFeedback(
+	ctx context.Context,
+	ghClient *githubv39.Client,
+	owner, repo string,
+	pr *githubv39.PullRequest,
+	comments []*githubv39.IssueComment,
+	reviews []*githubv39.PullRequestReview,
+	revCommentsMap map[int64][]*githubv39.PullRequestComment,
+	lastCommitTime time.Time,
+	since string,
+	cfg *config.FactoryConfig,
+) (oldComments []tasks.PRComment, newComments []tasks.PRComment, oldReviews []tasks.PRReview, newReviews []tasks.PRReview) {
+	var sinceTime time.Time
+	if since != "" {
+		if parsed, err := time.Parse(time.RFC3339, since); err == nil {
+			sinceTime = parsed
+		}
+	}
+
+	var bots []string
+	var triggerLabel string
+	if cfg != nil {
+		bots = cfg.AllowlistedBots
+		triggerLabel = cfg.TriggerLabel
+	}
+	if triggerLabel == "" {
+		triggerLabel = "overseer"
+	}
+	selfLogin := pr.GetUser().GetLogin()
+
+	var latestBotReplyTime time.Time
+	for _, c := range comments {
+		if !common.IsReviewerBot(c.GetUser(), cfg) && common.IsBotReply(c.GetUser(), selfLogin, bots) && !common.IsSystemOrInvestigateComment(c.GetBody()) && c.GetCreatedAt().After(latestBotReplyTime) {
+			latestBotReplyTime = c.GetCreatedAt()
+		}
+	}
+	for _, r := range reviews {
+		if !common.IsReviewerBot(r.GetUser(), cfg) && common.IsBotReply(r.GetUser(), selfLogin, bots) && !common.IsSystemOrInvestigateComment(r.GetBody()) && r.GetSubmittedAt().After(latestBotReplyTime) {
+			latestBotReplyTime = r.GetSubmittedAt()
+		}
+	}
+
+	for _, c := range comments {
+		if common.IsSystemOrInvestigateComment(c.GetBody()) || common.HasIgnorePrefix(c.GetBody(), triggerLabel) {
+			continue
+		}
+		cmt := tasks.PRComment{
+			ID:        c.GetID(),
+			UserLogin: c.GetUser().GetLogin(),
+			CreatedAt: c.GetCreatedAt().Format(time.RFC3339),
+			Body:      c.GetBody(),
+		}
+		if strings.EqualFold(c.GetUser().GetLogin(), selfLogin) || (common.ShouldIgnoreUser(c.GetUser(), selfLogin, bots) && !common.IsReviewerBot(c.GetUser(), cfg)) {
+			oldComments = append(oldComments, cmt)
+			continue
+		}
+
+		hasRocket := common.HasIssueCommentReaction(ctx, ghClient, owner, repo, c.GetID(), "rocket", false, bots, selfLogin)
+		isAddressed := common.HasIssueCommentReaction(ctx, ghClient, owner, repo, c.GetID(), "+1", true, bots, selfLogin) && !hasRocket
+		if isAddressed {
+			oldComments = append(oldComments, cmt)
+			continue
+		}
+
+		hasPendingReaction := hasRocket ||
+			common.HasIssueCommentReaction(ctx, ghClient, owner, repo, c.GetID(), "eyes", true, bots, selfLogin) ||
+			common.HasIssueCommentReaction(ctx, ghClient, owner, repo, c.GetID(), "confused", true, bots, selfLogin)
+
+		isNew := c.GetCreatedAt().After(latestBotReplyTime) &&
+			(c.GetCreatedAt().After(lastCommitTime) || (!sinceTime.IsZero() && !c.GetCreatedAt().Before(sinceTime)) || hasPendingReaction)
+		if isNew {
+			newComments = append(newComments, cmt)
+		} else {
+			oldComments = append(oldComments, cmt)
+		}
+	}
+
+	for _, r := range reviews {
+		if common.IsSystemOrInvestigateComment(r.GetBody()) || common.HasIgnorePrefix(r.GetBody(), triggerLabel) {
+			continue
+		}
+		revComments := revCommentsMap[r.GetID()]
+
+		if strings.EqualFold(r.GetUser().GetLogin(), selfLogin) || (common.ShouldIgnoreUser(r.GetUser(), selfLogin, bots) && !common.IsReviewerBot(r.GetUser(), cfg)) {
+			var inline []tasks.PullRequestComment
+			for _, rc := range revComments {
+				if common.HasIgnorePrefix(rc.GetBody(), triggerLabel) {
+					continue
+				}
+				inline = append(inline, tasks.PullRequestComment{
+					Path:     rc.GetPath(),
+					DiffHunk: rc.GetDiffHunk(),
+					Body:     rc.GetBody(),
+				})
+			}
+			if len(inline) > 0 || strings.TrimSpace(r.GetBody()) != "" {
+				oldReviews = append(oldReviews, tasks.PRReview{
+					ID:                  r.GetID(),
+					UserLogin:           r.GetUser().GetLogin(),
+					Body:                r.GetBody(),
+					PullRequestComments: inline,
+				})
+			}
+			continue
+		}
+
+		var oldInline []tasks.PullRequestComment
+		var newInline []tasks.PullRequestComment
+		for _, rc := range revComments {
+			if common.HasIgnorePrefix(rc.GetBody(), triggerLabel) {
+				continue
+			}
+			prc := tasks.PullRequestComment{
+				Path:     rc.GetPath(),
+				DiffHunk: rc.GetDiffHunk(),
+				Body:     rc.GetBody(),
+			}
+			hasRocket := common.HasPullRequestCommentReaction(ctx, ghClient, owner, repo, rc.GetID(), "rocket", false, bots, selfLogin)
+			isAddressed := common.HasPullRequestCommentReaction(ctx, ghClient, owner, repo, rc.GetID(), "+1", true, bots, selfLogin) && !hasRocket
+			if isAddressed {
+				oldInline = append(oldInline, prc)
+				continue
+			}
+			hasPendingReaction := hasRocket ||
+				common.HasPullRequestCommentReaction(ctx, ghClient, owner, repo, rc.GetID(), "eyes", true, bots, selfLogin) ||
+				common.HasPullRequestCommentReaction(ctx, ghClient, owner, repo, rc.GetID(), "confused", true, bots, selfLogin)
+
+			isNew := r.GetSubmittedAt().After(latestBotReplyTime) &&
+				(r.GetSubmittedAt().After(lastCommitTime) || (!sinceTime.IsZero() && !r.GetSubmittedAt().Before(sinceTime)) || hasPendingReaction)
+			if isNew {
+				newInline = append(newInline, prc)
+			} else {
+				oldInline = append(oldInline, prc)
+			}
+		}
+
+		if len(newInline) > 0 {
+			newReviews = append(newReviews, tasks.PRReview{
+				ID:                  r.GetID(),
+				UserLogin:           r.GetUser().GetLogin(),
+				Body:                r.GetBody(),
+				PullRequestComments: newInline,
+			})
+			if len(oldInline) > 0 {
+				oldReviews = append(oldReviews, tasks.PRReview{
+					ID:                  r.GetID(),
+					UserLogin:           r.GetUser().GetLogin(),
+					Body:                "",
+					PullRequestComments: oldInline,
+				})
+			}
+		} else if len(oldInline) > 0 {
+			oldReviews = append(oldReviews, tasks.PRReview{
+				ID:                  r.GetID(),
+				UserLogin:           r.GetUser().GetLogin(),
+				Body:                r.GetBody(),
+				PullRequestComments: oldInline,
+			})
+		} else if strings.TrimSpace(r.GetBody()) != "" {
+			isNewReview := r.GetSubmittedAt().After(latestBotReplyTime) &&
+				(r.GetSubmittedAt().After(lastCommitTime) || (!sinceTime.IsZero() && !r.GetSubmittedAt().Before(sinceTime)))
+			rev := tasks.PRReview{
+				ID:        r.GetID(),
+				UserLogin: r.GetUser().GetLogin(),
+				Body:      r.GetBody(),
+			}
+			if isNewReview {
+				newReviews = append(newReviews, rev)
+			} else {
+				oldReviews = append(oldReviews, rev)
+			}
+		}
+	}
+
+	return oldComments, newComments, oldReviews, newReviews
+}
+
+func runAddressComments(ctx context.Context, prURL, prompt string, continueSession bool, since string, ephemeralStorage string, secrets []factorysandbox.SecretMount) error {
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		klog.Warningf("Failed to load factory config: %v", err)
@@ -413,52 +592,23 @@ func runAddressComments(ctx context.Context, prURL, prompt string, continueSessi
 	if err != nil {
 		return fmt.Errorf("listing PR comments: %w", err)
 	}
-	var oldComments []tasks.PRComment
-	var newComments []tasks.PRComment
-	for _, c := range comments {
-		cmt := tasks.PRComment{
-			ID:        c.GetID(),
-			UserLogin: c.GetUser().GetLogin(),
-			CreatedAt: c.GetCreatedAt().Format(time.RFC3339),
-			Body:      c.GetBody(),
-		}
-		if c.GetCreatedAt().After(lastCommitTime) {
-			newComments = append(newComments, cmt)
-		} else {
-			oldComments = append(oldComments, cmt)
-		}
-	}
 
 	// Fetch PR reviews
 	reviews, err := github.ListAllReviews(ctx, ghClient, owner, repo, prNum)
 	if err != nil {
 		return fmt.Errorf("listing PR reviews: %w", err)
 	}
-	var oldReviews []tasks.PRReview
-	var newReviews []tasks.PRReview
+	revCommentsMap := make(map[int64][]*githubv39.PullRequestComment)
 	for _, r := range reviews {
-		rev := tasks.PRReview{
-			ID:        r.GetID(),
-			UserLogin: r.GetUser().GetLogin(),
-			Body:      r.GetBody(),
-		}
-		// Fetch review comments for this review
 		revComments, err := github.ListAllReviewComments(ctx, ghClient, owner, repo, prNum, r.GetID())
 		if err == nil {
-			for _, rc := range revComments {
-				rev.PullRequestComments = append(rev.PullRequestComments, tasks.PullRequestComment{
-					Path:     rc.GetPath(),
-					DiffHunk: rc.GetDiffHunk(),
-					Body:     rc.GetBody(),
-				})
-			}
-		}
-		if r.GetSubmittedAt().After(lastCommitTime) {
-			newReviews = append(newReviews, rev)
-		} else {
-			oldReviews = append(oldReviews, rev)
+			revCommentsMap[r.GetID()] = revComments
 		}
 	}
+
+	oldComments, newComments, oldReviews, newReviews := classifyPRFeedback(
+		ctx, ghClient, owner, repo, pr, comments, reviews, revCommentsMap, lastCommitTime, since, cfg,
+	)
 
 	if len(newComments) == 0 && len(newReviews) == 0 {
 		fmt.Printf("No new comments or reviews found for PR #%d since last commit.\n", prNum)
@@ -761,12 +911,14 @@ func runPRWatch(ctx context.Context, prURL string, interval time.Duration, dryRu
 
 				if hasNewComments {
 					fmt.Printf("\nFound new review comments for PR #%d. Triggering address-comments...\n", prNum)
-					lastCommentAddressedTime = time.Now()
 					if dryRun {
 						fmt.Printf("[DRYRUN] Would trigger address-comments for PR #%d\n", prNum)
+						lastCommentAddressedTime = time.Now()
 					} else {
-						if err := runAddressComments(ctx, prURL, "Address review feedback for this PR", continueSession, ephemeralStorage, secrets); err != nil {
+						if err := runAddressComments(ctx, prURL, "Address review feedback for this PR", continueSession, "", ephemeralStorage, secrets); err != nil {
 							klog.Errorf("Address-comments failed: %v", err)
+						} else {
+							lastCommentAddressedTime = time.Now()
 						}
 					}
 				}

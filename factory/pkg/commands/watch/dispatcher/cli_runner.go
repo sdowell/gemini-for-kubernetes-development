@@ -63,6 +63,9 @@ func (r *CLIRunner) BuildArgs(t *api.QueueTask, selectedUser string) []string {
 		args = []string{"pr", "investigate", "--pr-url", t.URL}
 	case api.TypePRComments:
 		args = []string{"pr", "address-comments", "--pr-url", t.URL}
+		if !t.TriggerEventTime.IsZero() {
+			args = append(args, "--since", t.TriggerEventTime.Format(time.RFC3339))
+		}
 	case api.TypePRIterate:
 		args = []string{"pr", "iterate", "--pr-url", t.URL, "--prompt", "Please resolve merge conflicts in this PR by rebasing onto the latest master/main branch and resolving any conflicts that arise."}
 	case api.TypePRReview:

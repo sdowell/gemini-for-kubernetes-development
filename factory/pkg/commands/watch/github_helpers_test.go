@@ -836,3 +836,206 @@ func TestReconcileReadyForHumanLabel(t *testing.T) {
 		})
 	}
 }
+
+func TestGetAddressCommentsCount(t *testing.T) {
+	t0 := time.Date(2026, 9, 16, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(5 * time.Minute)
+	t2 := t0.Add(10 * time.Minute)
+	t3 := t0.Add(15 * time.Minute)
+	t4 := t0.Add(20 * time.Minute)
+	t5 := t0.Add(25 * time.Minute)
+
+	cfg := &config.FactoryConfig{
+		Roles: map[string]config.RoleConfig{
+			"reviewer": {Users: []string{"gemini-code-assist[bot]"}},
+		},
+	}
+
+	tests := []struct {
+		name           string
+		comments       []*githubv39.IssueComment
+		reviews        []*githubv39.PullRequestReview
+		revCommentsMap map[int64][]*githubv39.PullRequestComment
+		lastCommitTime time.Time
+		expectedCount  int
+	}{
+		{
+			name: "Counts multiple failed attempts without reset on system or investigate comments",
+			comments: []*githubv39.IssueComment{
+				{
+					User:      &githubv39.User{Login: stringPtr("human-user")},
+					Body:      stringPtr("Please fix the nil pointer"),
+					CreatedAt: &t1,
+				},
+				{
+					User:      &githubv39.User{Login: stringPtr("overseer-bot")},
+					Body:      stringPtr("🤖 AI Factory started addressing review feedback for this pull request."),
+					CreatedAt: &t2,
+				},
+				{
+					User:      &githubv39.User{Login: stringPtr("overseer-bot")},
+					Body:      stringPtr("### Investigating CI Failure\nSome CI logs..."),
+					CreatedAt: &t3,
+				},
+				{
+					User:      &githubv39.User{Login: stringPtr("overseer-bot")},
+					Body:      stringPtr("🤖 AI Factory started addressing review feedback for this pull request."),
+					CreatedAt: &t4,
+				},
+			},
+			lastCommitTime: t0,
+			expectedCount:  2,
+		},
+		{
+			name: "Resets count when human adds a new comment",
+			comments: []*githubv39.IssueComment{
+				{
+					User:      &githubv39.User{Login: stringPtr("overseer-bot")},
+					Body:      stringPtr("🤖 AI Factory started addressing review feedback for this pull request."),
+					CreatedAt: &t1,
+				},
+				{
+					User:      &githubv39.User{Login: stringPtr("overseer-bot")},
+					Body:      stringPtr("🤖 AI Factory started addressing review feedback for this pull request."),
+					CreatedAt: &t2,
+				},
+				{
+					User:      &githubv39.User{Login: stringPtr("human-user")},
+					Body:      stringPtr("Actually try a different approach"),
+					CreatedAt: &t3,
+				},
+				{
+					User:      &githubv39.User{Login: stringPtr("overseer-bot")},
+					Body:      stringPtr("🤖 AI Factory started addressing review feedback for this pull request."),
+					CreatedAt: &t4,
+				},
+			},
+			lastCommitTime: t0,
+			expectedCount:  1,
+		},
+		{
+			name: "Resets count when reviewer bot submits a new inline review comment",
+			comments: []*githubv39.IssueComment{
+				{
+					User:      &githubv39.User{Login: stringPtr("overseer-bot")},
+					Body:      stringPtr("🤖 AI Factory started addressing review feedback for this pull request."),
+					CreatedAt: &t1,
+				},
+				{
+					User:      &githubv39.User{Login: stringPtr("overseer-bot")},
+					Body:      stringPtr("🤖 AI Factory started addressing review feedback for this pull request."),
+					CreatedAt: &t2,
+				},
+			},
+			reviews: []*githubv39.PullRequestReview{
+				{
+					ID:          githubv39.Int64(500),
+					User:        &githubv39.User{Login: stringPtr("gemini-code-assist[bot]"), Type: stringPtr("Bot")},
+					SubmittedAt: &t3,
+				},
+			},
+			revCommentsMap: map[int64][]*githubv39.PullRequestComment{
+				500: {
+					{
+						User:      &githubv39.User{Login: stringPtr("gemini-code-assist[bot]"), Type: stringPtr("Bot")},
+						Body:      stringPtr("Nit: rename variable"),
+						CreatedAt: &t3,
+					},
+				},
+			},
+			lastCommitTime: t0,
+			expectedCount:  0,
+		},
+		{
+			name: "Resets count when bot posts non-system feedback reply",
+			comments: []*githubv39.IssueComment{
+				{
+					User:      &githubv39.User{Login: stringPtr("overseer-bot")},
+					Body:      stringPtr("🤖 AI Factory started addressing review feedback for this pull request."),
+					CreatedAt: &t1,
+				},
+				{
+					User:      &githubv39.User{Login: stringPtr("overseer-bot")},
+					Body:      stringPtr("I have addressed the review comments in commit abc1234."),
+					CreatedAt: &t5,
+				},
+			},
+			lastCommitTime: t0,
+			expectedCount:  0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := getAddressCommentsCount(
+				tc.comments,
+				tc.reviews,
+				tc.revCommentsMap,
+				tc.lastCommitTime,
+				[]string{"overseer-bot"},
+				"overseer-bot",
+				nil,
+				"overseer",
+				cfg,
+			)
+			if got != tc.expectedCount {
+				t.Errorf("getAddressCommentsCount() = %d; want %d", got, tc.expectedCount)
+			}
+		})
+	}
+}
+
+func TestResolvePRCommentReactions(t *testing.T) {
+	var addedReactions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/repos/owner/repo/issues/1/comments":
+			_, _ = w.Write([]byte(`[
+				{"id": 101, "user": {"login": "human-user"}, "body": "fix this"},
+				{"id": 102, "user": {"login": "gemini-code-assist[bot]", "type": "Bot"}, "body": "review bot issue comment"}
+			]`))
+		case r.Method == "GET" && (r.URL.Path == "/repos/owner/repo/issues/comments/101/reactions" || r.URL.Path == "/repos/owner/repo/issues/comments/102/reactions"):
+			_, _ = w.Write([]byte(`[{"content": "eyes", "user": {"login": "overseer-bot"}}]`))
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/repos/owner/repo/issues/comments/"):
+			body, _ := io.ReadAll(r.Body)
+			addedReactions = append(addedReactions, r.URL.Path+":"+string(body))
+			_, _ = w.Write([]byte(`{"id": 1}`))
+		case r.Method == "GET" && r.URL.Path == "/repos/owner/repo/pulls/1/reviews":
+			_, _ = w.Write([]byte(`[{"id": 201, "user": {"login": "gemini-code-assist[bot]", "type": "Bot"}}]`))
+		case r.Method == "GET" && r.URL.Path == "/repos/owner/repo/pulls/1/reviews/201/comments":
+			_, _ = w.Write([]byte(`[
+				{"id": 301, "user": {"login": "human-user"}, "body": "inline human comment"},
+				{"id": 302, "user": {"login": "gemini-code-assist[bot]", "type": "Bot"}, "body": "inline reviewer bot comment"}
+			]`))
+		case r.Method == "GET" && (r.URL.Path == "/repos/owner/repo/pulls/comments/301/reactions" || r.URL.Path == "/repos/owner/repo/pulls/comments/302/reactions"):
+			_, _ = w.Write([]byte(`[{"content": "eyes", "user": {"login": "overseer-bot"}}]`))
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/repos/owner/repo/pulls/comments/"):
+			body, _ := io.ReadAll(r.Body)
+			addedReactions = append(addedReactions, r.URL.Path+":"+string(body))
+			_, _ = w.Write([]byte(`{"id": 2}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	ghClient := githubv39.NewClient(nil)
+	ghClient.BaseURL, _ = url.Parse(server.URL + "/")
+
+	resolvePRCommentReactions(context.Background(), ghClient, "owner", "repo", 1, "+1", []string{"overseer-bot"}, "overseer-bot")
+
+	expected := []string{
+		`/repos/owner/repo/issues/comments/101/reactions:{"content":"+1"}` + "\n",
+		`/repos/owner/repo/issues/comments/102/reactions:{"content":"+1"}` + "\n",
+		`/repos/owner/repo/pulls/comments/301/reactions:{"content":"+1"}` + "\n",
+		`/repos/owner/repo/pulls/comments/302/reactions:{"content":"+1"}` + "\n",
+	}
+	if len(addedReactions) != len(expected) {
+		t.Fatalf("addedReactions = %v; want %v", addedReactions, expected)
+	}
+	for i, exp := range expected {
+		if addedReactions[i] != exp {
+			t.Errorf("addedReactions[%d] = %q; want %q", i, addedReactions[i], exp)
+		}
+	}
+}

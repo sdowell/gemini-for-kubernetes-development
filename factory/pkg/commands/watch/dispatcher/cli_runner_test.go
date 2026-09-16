@@ -132,6 +132,30 @@ func TestCLIRunner_BuildArgs(t *testing.T) {
 		}
 	})
 
+	t.Run("pr-comments task with TriggerEventTime passes --since", func(t *testing.T) {
+		triggerTime := time.Date(2026, 9, 16, 12, 30, 0, 0, time.UTC)
+		task := &api.QueueTask{
+			Type:             api.TypePRComments,
+			URL:              "https://github.com/test-owner/test-repo/pull/12861",
+			Number:           12861,
+			TriggerEventTime: triggerTime,
+		}
+		args := r.BuildArgs(task, "coder-bot")
+		if len(args) < 2 || args[0] != "pr" || args[1] != "address-comments" {
+			t.Fatalf("expected command 'pr address-comments', got %v", args)
+		}
+		sinceFound := false
+		for i, a := range args {
+			if a == "--since" && i+1 < len(args) && args[i+1] == triggerTime.Format(time.RFC3339) {
+				sinceFound = true
+				break
+			}
+		}
+		if !sinceFound {
+			t.Errorf("expected --since %s in args, got: %v", triggerTime.Format(time.RFC3339), args)
+		}
+	})
+
 	t.Run("unknown task type returns nil", func(t *testing.T) {
 		task := &api.QueueTask{
 			Type: "unknown-type",
