@@ -126,15 +126,18 @@ type Dispatcher struct {
 	// wg tracks in-flight task workers spawned by the dispatcher.
 	wg sync.WaitGroup
 
-	// taskCtxMu guards taskCtx and cancelTasks.
+	// taskCtxMu guards taskCtx, cancelTasks, and running.
 	taskCtxMu sync.RWMutex
-	// taskCtx is the context in-flight task workers run under. Run installs one that
-	// is detached from the dispatch loop's context, so that stopping the loop does not
-	// abort work already running; it is nil until Run installs it.
+	// taskCtx is the context in-flight task workers (both newly dispatched and
+	// adopted) run under. It is detached from the dispatch loop's context so that
+	// stopping the loop does not abort work already running.
 	taskCtx context.Context
 	// cancelTasks aborts the workers running under taskCtx. It is only invoked once
 	// the shutdown grace period is exhausted.
 	cancelTasks context.CancelFunc
+	// running reports whether Run is currently active. While Run is active, workers
+	// ignore cancellation of the caller's context and are only cancelled by drain.
+	running bool
 }
 
 // New constructs a Dispatcher from its configuration and dependencies.
@@ -163,12 +166,20 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	// context stops supervising work that carries on regardless. Give workers a
 	// context that outlives the dispatch loop and let drain decide when, if ever,
 	// to actually cancel them.
-	taskCtx, cancelTasks := context.WithCancel(context.WithoutCancel(ctx))
 	d.taskCtxMu.Lock()
-	d.taskCtx, d.cancelTasks = taskCtx, cancelTasks
+	_ = d.ensureTaskContextLocked(ctx)
+	d.running = true
 	d.taskCtxMu.Unlock()
 
-	defer cancelTasks()
+	defer func() {
+		d.taskCtxMu.Lock()
+		d.running = false
+		cancel := d.cancelTasks
+		d.taskCtxMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+	}()
 	defer d.wg.Wait()
 
 	d.DispatchOnce(ctx)
@@ -230,19 +241,40 @@ func (d *Dispatcher) cancelInFlightTasks() {
 	}
 }
 
-// workerContext returns the context a newly dispatched task worker should run under.
-//
-// Run installs a context detached from the dispatch loop. Callers that drive
-// DispatchOnce directly (one-shot runs and tests) keep the caller's context, so
-// cancelling it still aborts their tasks.
-func (d *Dispatcher) workerContext(ctx context.Context) context.Context {
-	d.taskCtxMu.RLock()
-	defer d.taskCtxMu.RUnlock()
-
-	if d.taskCtx != nil {
-		return d.taskCtx
+// ensureTaskContextLocked initializes taskCtx if needed. Must be called with taskCtxMu locked.
+func (d *Dispatcher) ensureTaskContextLocked(ctx context.Context) context.Context {
+	if d.taskCtx == nil || d.taskCtx.Err() != nil {
+		d.taskCtx, d.cancelTasks = context.WithCancel(context.WithoutCancel(ctx))
 	}
-	return ctx
+	return d.taskCtx
+}
+
+// workerContext returns the context a newly dispatched or adopted task worker
+// should run under, along with a cleanup function the worker must call when done.
+//
+// Under Run, workers run under a context detached from the dispatch loop so that
+// stopping the loop lets them drain within ShutdownGracePeriod before cancelTasks
+// aborts them. Callers that drive DispatchOnce or Recover directly without Run
+// (one-shot runs and tests) still abort their workers when the caller's context is
+// cancelled.
+func (d *Dispatcher) workerContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	d.taskCtxMu.Lock()
+	baseCtx := d.ensureTaskContextLocked(ctx)
+	d.taskCtxMu.Unlock()
+
+	wCtx, cancel := context.WithCancel(baseCtx)
+	stop := context.AfterFunc(ctx, func() {
+		d.taskCtxMu.RLock()
+		running := d.running
+		d.taskCtxMu.RUnlock()
+		if !running {
+			cancel()
+		}
+	})
+	return wCtx, func() {
+		stop()
+		cancel()
+	}
 }
 
 // shutdownGracePeriod returns the configured drain window, or the default.
@@ -382,11 +414,12 @@ func (d *Dispatcher) dispatchTask(ctx context.Context, filename string, task *ap
 	}
 
 	// The worker outlives the dispatch loop: see Run and drain.
-	workerCtx := d.workerContext(ctx)
+	workerCtx, cancelWorker := d.workerContext(ctx)
 
 	d.wg.Add(1)
 	go func() {
 		defer func() {
+			cancelWorker()
 			d.sandboxLocks.Release(sandboxName, filename)
 			d.wg.Done()
 		}()

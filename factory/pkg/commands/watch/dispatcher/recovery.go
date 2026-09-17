@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -86,13 +87,15 @@ func (d *Dispatcher) adoptTask(ctx context.Context, filename string, task *api.Q
 	}
 
 	klog.Infof("Task %s is still actively running in sandbox %s. Adopting task.", filename, sandboxName)
+	workerCtx, cancelWorker := d.workerContext(ctx)
 	d.wg.Add(1)
 	go func() {
 		defer func() {
+			cancelWorker()
 			d.sandboxLocks.Release(sandboxName, filename)
 			d.wg.Done()
 		}()
-		d.monitorAdoptedTask(ctx, filename, task, sandboxName)
+		d.monitorAdoptedTask(workerCtx, filename, task, sandboxName)
 	}()
 }
 
@@ -112,6 +115,10 @@ func (d *Dispatcher) monitorAdoptedTask(ctx context.Context, taskFilename string
 	for {
 		select {
 		case <-monitorCtx.Done():
+			if errors.Is(ctx.Err(), context.Canceled) {
+				klog.Warningf("Adopted task %s was interrupted by dispatcher shutdown. Leaving it in the processing queue for recovery on the next run.", taskFilename)
+				return
+			}
 			if monitorCtx.Err() == context.DeadlineExceeded {
 				d.failTimedOutAdoptedTask(ctx, taskFilename, task, sandboxName)
 			}
@@ -129,6 +136,10 @@ func (d *Dispatcher) monitorAdoptedTask(ctx context.Context, taskFilename string
 			// Task has finished! Check whether it completed or failed
 			completed, err := d.sandboxes.IsTaskCompleted(monitorCtx, sandboxName, task.Type)
 			if err != nil {
+				if errors.Is(ctx.Err(), context.Canceled) {
+					klog.Warningf("Adopted task %s was interrupted by dispatcher shutdown. Leaving it in the processing queue for recovery on the next run.", taskFilename)
+					return
+				}
 				klog.Warningf("Failed to check completion state of adopted sandbox %s: %v", sandboxName, err)
 			}
 

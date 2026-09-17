@@ -220,3 +220,75 @@ func TestAdoptionPollInterval_Default(t *testing.T) {
 		t.Errorf("adoptionPollInterval = %s, want 1s", got)
 	}
 }
+
+func TestRun_DrainLetsAdoptedTaskFinishAfterShutdown(t *testing.T) {
+	tempDir := t.TempDir()
+	d, queue, sandboxes, coordinator, _ := testDispatcher(t, tempDir, func(cfg *Config, _ *Deps) {
+		cfg.AdoptionPollInterval = 5 * time.Millisecond
+		cfg.ShutdownGracePeriod = 10 * time.Second
+	})
+	sandboxes.running["sandbox"] = true
+
+	writeProcessingTask(t, tempDir, "task-issue-106.yaml", 106)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	d.Recover(ctx)
+	runDone := runDispatcher(ctx, d)
+
+	// Wait for Run to enter its loop before cancelling ctx.
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	// The adopted task monitor runs under taskCtx (detached from ctx), so it keeps
+	// supervising during drain and records completion when the sandbox finishes.
+	time.Sleep(20 * time.Millisecond)
+	sandboxes.mu.Lock()
+	sandboxes.running["sandbox"] = false
+	sandboxes.completed["sandbox"] = true
+	sandboxes.mu.Unlock()
+
+	awaitRunReturn(t, runDone)
+
+	waitForCounts(t, queue, 0, 0, 1)
+	outcomes := coordinator.outcomes()
+	if len(outcomes) != 1 || outcomes[0] != nil {
+		t.Errorf("expected the drained adopted task to report success, got %v", outcomes)
+	}
+	if d.sandboxLocks.IsBusy("sandbox") {
+		t.Error("expected the sandbox lease to be released after the adopted task completed")
+	}
+}
+
+func TestRun_DrainCancelsAdoptedTasksThatOutlastGracePeriod(t *testing.T) {
+	tempDir := t.TempDir()
+	d, queue, sandboxes, coordinator, _ := testDispatcher(t, tempDir, func(cfg *Config, _ *Deps) {
+		cfg.AdoptionPollInterval = 5 * time.Millisecond
+		cfg.ShutdownGracePeriod = 50 * time.Millisecond
+	})
+	sandboxes.running["sandbox"] = true
+
+	writeProcessingTask(t, tempDir, "task-issue-107.yaml", 107)
+
+	// Mirror Watcher.Run: Recover is called with parent context, Run with child daemonCtx.
+	parentCtx := context.Background()
+	d.Recover(parentCtx)
+
+	daemonCtx, daemonCancel := context.WithCancel(parentCtx)
+	runDone := runDispatcher(daemonCtx, d)
+
+	time.Sleep(20 * time.Millisecond)
+	daemonCancel()
+
+	// Even though parentCtx is never cancelled, drain's cancelInFlightTasks aborts
+	// the adopted task monitor via taskCtx once the grace period expires.
+	awaitRunReturn(t, runDone)
+
+	waitForCounts(t, queue, 0, 1, 0)
+	if outcomes := coordinator.outcomes(); len(outcomes) != 0 {
+		t.Errorf("expected no finish notification for an adopted task cut short by shutdown, got %v", outcomes)
+	}
+	if d.sandboxLocks.IsBusy("sandbox") {
+		t.Error("expected the sandbox lease to be released after the adopted task monitor was cancelled")
+	}
+}
+
