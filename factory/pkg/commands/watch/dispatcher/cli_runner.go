@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -63,6 +64,13 @@ func (r *CLIRunner) BuildArgs(t *api.QueueTask, selectedUser string) []string {
 		args = []string{"pr", "investigate", "--pr-url", t.URL}
 	case api.TypePRComments:
 		args = []string{"pr", "address-comments", "--pr-url", t.URL}
+		// A retry is told that it is one, because the agent otherwise decides
+		// what is outstanding from the last commit alone - and a failed
+		// attempt may well have committed something before it died, which
+		// would hide the very feedback the retry exists to address.
+		if t.Retries > 0 {
+			args = append(args, "--retry", strconv.Itoa(t.Retries))
+		}
 	case api.TypePRIterate:
 		args = []string{"pr", "iterate", "--pr-url", t.URL, "--prompt", "Please resolve merge conflicts in this PR by rebasing onto the latest master/main branch and resolving any conflicts that arise."}
 	case api.TypePRReview:

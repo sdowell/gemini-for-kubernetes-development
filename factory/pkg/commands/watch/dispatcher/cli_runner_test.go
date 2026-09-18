@@ -132,6 +132,45 @@ func TestCLIRunner_BuildArgs(t *testing.T) {
 		}
 	})
 
+	// A retry says so on the command line, because the agent otherwise works
+	// out what is outstanding from the last commit - and a failed attempt may
+	// well have pushed one before it died.
+	t.Run("pr-comments retry", func(t *testing.T) {
+		task := &api.QueueTask{
+			Type:    api.TypePRComments,
+			URL:     "https://github.com/test-owner/test-repo/pull/456",
+			Number:  456,
+			Retries: 2,
+		}
+		args := r.BuildArgs(task, "coder-bot")
+		if len(args) < 2 || args[0] != "pr" || args[1] != "address-comments" {
+			t.Fatalf("expected command 'pr address-comments', got %v", args)
+		}
+
+		retry := ""
+		for i, a := range args {
+			if a == "--retry" && i+1 < len(args) {
+				retry = args[i+1]
+			}
+		}
+		if retry != "2" {
+			t.Errorf("--retry = %q, want \"2\"", retry)
+		}
+	})
+
+	t.Run("pr-comments first attempt", func(t *testing.T) {
+		task := &api.QueueTask{
+			Type:   api.TypePRComments,
+			URL:    "https://github.com/test-owner/test-repo/pull/456",
+			Number: 456,
+		}
+		for _, a := range r.BuildArgs(task, "coder-bot") {
+			if a == "--retry" {
+				t.Errorf("unexpected --retry on a first attempt")
+			}
+		}
+	})
+
 	t.Run("unknown task type returns nil", func(t *testing.T) {
 		task := &api.QueueTask{
 			Type: "unknown-type",

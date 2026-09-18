@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	githubv39 "github.com/google/go-github/v39/github"
@@ -32,6 +33,20 @@ const maxInvestigations = 3
 // infrastructure and transient failures do resolve themselves, and after a
 // couple of hours a retry is cheaper than a stuck pull request.
 const investigationRetryAfter = 2 * time.Hour
+
+// maxCommentRetries is how many times an address-comments task that ended in
+// failure is re-queued before the watcher gives up and hands the pull request
+// back to a human.
+//
+// Unlike an investigation, a failed address-comments task cannot be left to the
+// next scan to notice: the watcher reacts to every comment it picks up, and
+// those reactions are what make the feedback invisible to the scan that
+// follows. So the retry has to be deliberate, and therefore bounded - the
+// common causes of failure (an exhausted Gemini quota, a sandbox that died)
+// clear on their own within a few attempts, and anything that does not is a
+// loop rather than a transient. The count resets whenever new feedback arrives,
+// so this bounds futile repetition of the same work, not the pull request.
+const maxCommentRetries = 3
 
 // prContext is the per-pull-request facts each handler needs, assembled once so
 // that the handlers do not each re-derive them.
@@ -144,15 +159,79 @@ func (s *Scanner) canInvestigatePR(
 // in failure, which makes the same revision worth retrying: the agent never got
 // to finish, so its verdict says nothing about the CI failure.
 func (s *Scanner) lastInvestigationFailed(filename string) bool {
+	return taskFailed(s.loadProcessedTask(filename))
+}
+
+// loadProcessedTask reads the last completed run of a task file, or returns nil
+// when there is none to read.
+//
+// The processed directory is the watcher's memory of what it has already done:
+// unlike the in-memory state it survives a restart, and unlike GitHub it
+// records why a run ended. That makes it the only place a retry decision can
+// honestly be made from.
+func (s *Scanner) loadProcessedTask(filename string) *api.QueueTask {
 	data, err := os.ReadFile(filepath.Join(s.cfg.ProcessedDir, filename))
 	if err != nil {
-		return false
+		return nil
 	}
 	var t api.QueueTask
 	if err := yaml.Unmarshal(data, &t); err != nil {
-		return false
+		return nil
 	}
-	return t.Status == api.StatusFailed
+	return &t
+}
+
+// taskFailed reports whether a completed task ended in failure. The comparison
+// is case-insensitive because the status is also written by hand into task
+// files during operational fixups.
+func taskFailed(t *api.QueueTask) bool {
+	return t != nil && strings.EqualFold(string(t.Status), string(api.StatusFailed))
+}
+
+// failedCommentsTask returns the address-comments task whose failure is still
+// outstanding for a pull request, or nil when there is nothing to retry.
+//
+// This is what makes the retry idempotent. The verdict comes from the single
+// task file the pull request's address-comments work is written to, so a task
+// already queued or running is not retried, and a retry that finishes replaces
+// the failure it was answering - leaving nothing for the next scan to act on.
+// The attempt count travels in the file too, which is what keeps the budget
+// intact across watcher restarts.
+//
+// A task whose count has passed the limit has already been given up on and
+// announced, and is likewise nothing to act on: without that the pull request
+// would be re-labelled the moment a human removed the stop label the giving up
+// applied.
+func (s *Scanner) failedCommentsTask(num int) *api.QueueTask {
+	filename := fmt.Sprintf("task-pr-%d-comments.yaml", num)
+	if s.queue.TaskExists(filename) {
+		return nil
+	}
+	t := s.loadProcessedTask(filename)
+	if !taskFailed(t) || t.Retries > maxCommentRetries {
+		return nil
+	}
+	return t
+}
+
+// markCommentRetriesExhausted records in the task file that the watcher has
+// given up on a pull request's feedback and said so.
+//
+// The count is pushed one past the limit rather than a separate flag being
+// added: "more attempts than the budget allows" is precisely the state being
+// recorded, and it is the same field every other decision here reads.
+func (s *Scanner) markCommentRetriesExhausted(num int, failed *api.QueueTask) {
+	filename := fmt.Sprintf("task-pr-%d-comments.yaml", num)
+	t := *failed
+	t.Retries = maxCommentRetries + 1
+	data, err := yaml.Marshal(&t)
+	if err != nil {
+		klog.Errorf("Failed to marshal exhausted address-comments task for PR #%d: %v", num, err)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(s.cfg.ProcessedDir, filename), data, 0644); err != nil {
+		klog.Errorf("Failed to record exhausted address-comments retries for PR #%d: %v", num, err)
+	}
 }
 
 // handlePRInvestigate queues an investigation of the pull request's CI
@@ -242,7 +321,17 @@ func (s *Scanner) handlePRInvestigate(
 }
 
 // handlePRComments queues a task to address the outstanding review feedback.
-func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAnalysis prCommentAnalysis) {
+//
+// failed is the pull request's last address-comments task when it ended in
+// failure, and nil otherwise. A failed attempt is re-queued rather than
+// forgotten: the watcher reacted to every comment it handed over, so without a
+// retry that feedback is never looked at again.
+//
+// Which comments the retry covers is not recorded here. The reactions on the
+// comments themselves say that - a failed attempt leaves them marked confused,
+// which is what puts them back in front of the next scan - so the only thing
+// the task file has to remember is how many attempts have been spent.
+func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAnalysis prCommentAnalysis, failed *api.QueueTask) {
 	if os.Getenv("DRY_RUN") == "true" {
 		return
 	}
@@ -252,6 +341,26 @@ func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAn
 
 	if s.queue.TaskExists(filename) {
 		return
+	}
+
+	// New feedback starts the budget over. The budget is patience with
+	// repeated failure, and a reviewer who has since said something new is
+	// owed a fresh allowance of it.
+	//
+	// A new revision deliberately does not count, tempting though it is to
+	// read one as progress. A failed attempt often pushes a commit before it
+	// dies - that is the very failure this retry exists for - so counting a
+	// new head would let every attempt reset its own budget and retry for
+	// ever. Nor does a commit mean the feedback was answered: the agent can
+	// address a comment without committing, and a commit can have nothing to
+	// do with the review. Only the '+1' says the work was done.
+	retries := 0
+	if failed != nil && !newFeedbackSince(failed, commentAnalysis) {
+		retries = failed.Retries + 1
+		if retries > maxCommentRetries {
+			s.giveUpOnComments(ctx, pc, failed)
+			return
+		}
 	}
 
 	sandboxName := s.sandboxes.ResolveName(ctx, api.TypePRComments, num)
@@ -264,19 +373,27 @@ func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAn
 		return
 	}
 
-	commitInfo := ""
-	if !pc.lastCommitTime.IsZero() {
-		commitInfo = fmt.Sprintf(" since last commit %s (committer date %s)", pc.shortSHA, pc.lastCommitTime.Format(time.RFC3339))
+	// The task is ordered by the oldest piece of feedback still waiting, which
+	// for a retry is whatever its predecessor was queued for: a second attempt
+	// should not go to the back of the queue behind work raised after it.
+	eventTime := commentAnalysis.oldestCommentTime
+	if failed != nil && !failed.TriggerEventTime.IsZero() &&
+		(eventTime.IsZero() || failed.TriggerEventTime.Before(eventTime)) {
+		eventTime = failed.TriggerEventTime
 	}
-	authorStr := ""
-	if commentAnalysis.oldestCommentAuthor != "" {
-		authorStr = fmt.Sprintf(" by %s", commentAnalysis.oldestCommentAuthor)
+
+	notes := commentTriggerNotes(pc, commentAnalysis)
+	switch {
+	case retries > 0:
+		reason := strings.TrimSpace(failed.Error)
+		if reason == "" {
+			reason = "no error recorded"
+		}
+		notes = fmt.Sprintf("Retry %d of %d after a failed attempt to address %d comment(s) and %d inline review comment(s): %s",
+			retries, maxCommentRetries, len(commentAnalysis.unackCommentIDs), len(commentAnalysis.unackPRCommentIDs), truncate(reason, 300))
+	case failed != nil:
+		notes += "; also re-attempting the feedback a previous failed task left unaddressed"
 	}
-	cType := commentAnalysis.oldestCommentType
-	if cType == "" {
-		cType = "comment"
-	}
-	notes := fmt.Sprintf("Oldest unaddressed %s%s added at %s (ID %d)%s", cType, authorStr, commentAnalysis.oldestCommentTime.Format(time.RFC3339), commentAnalysis.oldestCommentID, commitInfo)
 
 	task := s.newTask(taskOptions{
 		Type:             api.TypePRComments,
@@ -285,16 +402,21 @@ func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAn
 		Phase:            api.PhaseComments,
 		Assignee:         pc.taskAssignee,
 		CommitSHA:        pc.headSHA,
-		TriggerEventTime: commentAnalysis.oldestCommentTime,
+		TriggerEventTime: eventTime,
 		TriggerReason:    api.TriggerReasonPRCommentsAdded,
 		TriggerNotes:     notes,
+		Retries:          retries,
 	})
 
 	if s.cfg.DryRun {
 		fmt.Printf("[DRYRUN] Would queue address-comments task for PR #%d: %s\n", num, pc.prURL)
 		return
 	}
-	fmt.Printf("Queueing address-comments task for PR #%d...\n", num)
+	if retries > 0 {
+		fmt.Printf("Queueing address-comments retry %d/%d for PR #%d...\n", retries, maxCommentRetries, num)
+	} else {
+		fmt.Printf("Queueing address-comments task for PR #%d...\n", num)
+	}
 	// The 'eyes' reactions are what tell the next cycle these comments are
 	// already spoken for, and what tell the commenter they were seen.
 	for _, cid := range commentAnalysis.unackCommentIDs {
@@ -309,6 +431,78 @@ func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAn
 	if err := s.queue.Enqueue(filename, task); err != nil {
 		klog.Errorf("Failed to queue address-comments task for PR #%d: %v", num, err)
 	}
+}
+
+// commentTriggerNotes describes the feedback a task was queued for, singling out
+// the comment that has been waiting longest.
+func commentTriggerNotes(pc *prContext, commentAnalysis prCommentAnalysis) string {
+	commitInfo := ""
+	if !pc.lastCommitTime.IsZero() {
+		commitInfo = fmt.Sprintf(" since last commit %s (committer date %s)", pc.shortSHA, pc.lastCommitTime.Format(time.RFC3339))
+	}
+	authorStr := ""
+	if commentAnalysis.oldestCommentAuthor != "" {
+		authorStr = fmt.Sprintf(" by %s", commentAnalysis.oldestCommentAuthor)
+	}
+	cType := commentAnalysis.oldestCommentType
+	if cType == "" {
+		cType = "comment"
+	}
+	return fmt.Sprintf("Oldest unaddressed %s%s added at %s (ID %d)%s", cType, authorStr, commentAnalysis.oldestCommentTime.Format(time.RFC3339), commentAnalysis.oldestCommentID, commitInfo)
+}
+
+// giveUpOnComments stops retrying a pull request's review feedback and hands it
+// back to a human.
+//
+// The decision is announced on the pull request rather than taken silently,
+// because the feedback itself is now invisible to the watcher: the comments
+// carry its acknowledgement reactions, so nothing short of new feedback
+// arriving will make it look at them again.
+//
+// It is also written back to the task file, so that it happens once. Otherwise
+// removing the stop label - the very thing the announcement asks for - would
+// hand the pull request straight back to this function and have it re-applied.
+func (s *Scanner) giveUpOnComments(ctx context.Context, pc *prContext, failed *api.QueueTask) {
+	num := pc.prIssue.GetNumber()
+	stopLabel := conventions.StopLabel(s.cfg.TriggerLabel)
+
+	klog.Infof("Skipping PR #%d address-comments because it has failed %d times in a row; applying stop label '%s'.", num, maxCommentRetries+1, stopLabel)
+	if s.cfg.DryRun {
+		fmt.Printf("[DRYRUN] Would pause address-comments on PR #%d and apply label '%s'\n", num, stopLabel)
+		return
+	}
+
+	s.markCommentRetriesExhausted(num, failed)
+
+	reason := strings.TrimSpace(failed.Error)
+	if reason == "" {
+		reason = "no error was recorded"
+	}
+	s.comment(ctx, num, fmt.Sprintf("🤖 AI Factory has attempted to address the review feedback on this pull request %d times without success, most recently failing with:\n\n```\n%s\n```\n\nTo prevent infinite loops, I am pausing automated processing and attaching the `%s` label. The outstanding feedback has **not** been addressed.\n\nTo request another attempt, please remove the `%s` label and leave a new comment describing what you would like changed.", maxCommentRetries+1, truncate(reason, 1000), stopLabel, stopLabel))
+	if err := s.gh.AddLabels(ctx, num, []string{stopLabel}); err != nil {
+		klog.Errorf("Failed to add stop label '%s' to PR #%d: %v", stopLabel, num, err)
+	}
+}
+
+// newFeedbackSince reports whether a reviewer has said something new since a
+// failed address-comments attempt was queued.
+//
+// The comparison is against when the attempt started rather than when it
+// finished, because a comment written while it was running is one it may never
+// have read: the feedback it was given was fixed when its prompt was built.
+func newFeedbackSince(failed *api.QueueTask, commentAnalysis prCommentAnalysis) bool {
+	return !failed.StartedAt.IsZero() && commentAnalysis.newestCommentTime.After(failed.StartedAt)
+}
+
+// truncate shortens a string to at most n characters, marking where it was cut.
+// Task errors carry whole agent transcripts, and those belong in the log rather
+// than in a trigger note or a pull request comment.
+func truncate(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "... (truncated)"
 }
 
 // handlePRReview queues an automated review of a green, unreviewed pull request.

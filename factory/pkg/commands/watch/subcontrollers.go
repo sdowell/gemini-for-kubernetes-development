@@ -287,6 +287,12 @@ func (c *watcherTaskCoordinator) NotifyTaskStarted(ctx context.Context, task *ap
 	}
 
 	if commentBody := taskStartedComment(task.Type); commentBody != "" {
+		// A retry says so. Without it the thread reads as the same work being
+		// announced over and over with no explanation, which is exactly how a
+		// silently failing task looked before it was retried at all.
+		if task.Retries > 0 {
+			commentBody = fmt.Sprintf("%s\n\n_(Retry %d - the previous attempt did not complete.)_", commentBody, task.Retries)
+		}
 		if err := w.repoClient.AddComment(ctx, task.Number, commentBody); err != nil {
 			klog.Errorf("Failed to create GitHub comment on #%d: %v", task.Number, err)
 		}
@@ -299,11 +305,7 @@ func (c *watcherTaskCoordinator) NotifyTaskFinished(ctx context.Context, task *a
 	if task.Type != api.TypePRComments || w.cfg == nil {
 		return
 	}
-	resolution := "+1"
-	if taskErr != nil {
-		resolution = "confused"
-	}
-	conventions.ResolveCommentReactions(ctx, w.repoClient, task.Number, resolution, w.cfg.AllowlistedBots, w.githubLogin)
+	conventions.ResolveCommentReactions(ctx, w.repoClient, task.Number, taskErr == nil, w.cfg.AllowlistedBots, w.githubLogin)
 }
 
 // taskStartedComment returns the GitHub comment announcing that a task has started,

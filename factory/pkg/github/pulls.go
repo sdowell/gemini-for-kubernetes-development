@@ -112,6 +112,35 @@ func (c *Client) ListReviewComments(ctx context.Context, number int, reviewID in
 	}
 }
 
+// ListAllReviewComments returns every inline comment on a pull request,
+// regardless of which review it belongs to, following pagination.
+//
+// Grouping by review is how the scanner reads feedback - a review and its
+// comments are one piece of feedback - but closing out acknowledgements works
+// comment by comment, and asking per review would cost a request per review to
+// rebuild a list GitHub will hand over in one.
+func (c *Client) ListAllReviewComments(ctx context.Context, number int) ([]*githubv39.PullRequestComment, error) {
+	if !c.Ready() {
+		return nil, errNoClient
+	}
+
+	var all []*githubv39.PullRequestComment
+	opt := &githubv39.PullRequestListCommentsOptions{
+		ListOptions: githubv39.ListOptions{PerPage: 100},
+	}
+	for {
+		comments, resp, err := c.gh.PullRequests.ListComments(ctx, c.owner, c.repo, number, opt)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, comments...)
+		if resp == nil || resp.NextPage == 0 {
+			return all, nil
+		}
+		opt.Page = resp.NextPage
+	}
+}
+
 // IsInMergeQueue reports whether a pull request is currently sitting in the
 // repository's merge queue.
 func (c *Client) IsInMergeQueue(ctx context.Context, number int) (bool, error) {

@@ -23,6 +23,9 @@ type taskOptions struct {
 	TriggerReason    api.TriggerReason
 	TriggerNotes     string
 	Instructions     []string
+	// Retries is the attempt number, counting from zero for the first attempt
+	// at a piece of work.
+	Retries int
 }
 
 // newTask constructs the queue task for a pull request with consistent defaults.
@@ -55,5 +58,6 @@ func (s *Scanner) newTask(opts taskOptions) *api.QueueTask {
 		Status:           api.StatusPending,
 		CommitSHA:        opts.CommitSHA,
 		Instructions:     opts.Instructions,
+		Retries:          opts.Retries,
 	}
 }

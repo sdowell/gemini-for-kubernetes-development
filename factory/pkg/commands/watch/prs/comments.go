@@ -15,7 +15,9 @@ import (
 //
 // The oldest unaddressed comment is singled out, not the newest: it is the one
 // that has been waiting longest, and quoting it in the task gives the agent the
-// start of the conversation rather than its tail.
+// start of the conversation rather than its tail. The newest is tracked too,
+// but for a different question - whether anything has been said since an
+// attempt failed, which is what tells a retry apart from a fresh request.
 type prCommentAnalysis struct {
 	hasNewComments      bool
 	unackCommentIDs     []int64
@@ -24,6 +26,7 @@ type prCommentAnalysis struct {
 	oldestCommentAuthor string
 	oldestCommentType   string
 	oldestCommentID     int64
+	newestCommentTime   time.Time
 }
 
 // evaluateComments decides whether a pull request has feedback still waiting on
@@ -35,9 +38,13 @@ type prCommentAnalysis struct {
 // reply (which already answered it in the thread). Any one of those being newer
 // means the feedback has been dealt with.
 //
-// Reactions are the second gate, and they encode who said what: the watcher's
-// own '+1', 'eyes' or 'confused' mean it has already picked the comment up,
-// while a human's 'rocket' overrides them to ask for another pass.
+// The watcher's reactions are the second gate, and they are the record of what
+// it has actually done with each comment: '+1' means addressed, 'eyes' means
+// picked up with the outcome not yet known, and 'confused' means an attempt
+// failed - which puts the comment back in this set rather than taking it out.
+// That last case is the only thing on GitHub that distinguishes feedback nobody
+// got to from feedback that was answered, and a human's 'rocket' overrides all
+// of them to ask for another pass.
 //
 // Human feedback always wins. Bot review feedback is held back when an
 // address-comments task already ran against this exact commit, because the
@@ -76,11 +83,17 @@ func (s *Scanner) evaluateComments(
 	hasNewBotReviews := false
 
 	updateOldestComment := func(t time.Time, author string, cType string, id int64) {
-		if !t.IsZero() && (analysis.oldestCommentTime.IsZero() || t.Before(analysis.oldestCommentTime)) {
+		if t.IsZero() {
+			return
+		}
+		if analysis.oldestCommentTime.IsZero() || t.Before(analysis.oldestCommentTime) {
 			analysis.oldestCommentTime = t
 			analysis.oldestCommentAuthor = author
 			analysis.oldestCommentType = cType
 			analysis.oldestCommentID = id
+		}
+		if t.After(analysis.newestCommentTime) {
+			analysis.newestCommentTime = t
 		}
 	}
 
@@ -97,16 +110,7 @@ func (s *Scanner) evaluateComments(
 			continue
 		}
 		if c.GetCreatedAt().After(lastCommitTime) && c.GetCreatedAt().After(lastCommentAddressedTime) && c.GetCreatedAt().After(latestBotReplyTime) {
-			if conventions.HasIssueCommentReaction(ctx, s.gh, c.GetID(), "+1", true, bots, s.cfg.GitHubLogin) {
-				continue
-			}
-			// A human's 'rocket' is an explicit request to look again, and
-			// overrides the watcher's own acknowledgements.
-			humanRocket := conventions.HasIssueCommentReaction(ctx, s.gh, c.GetID(), "rocket", false, bots, s.cfg.GitHubLogin)
-			if !humanRocket && conventions.HasIssueCommentReaction(ctx, s.gh, c.GetID(), "eyes", true, bots, s.cfg.GitHubLogin) {
-				continue
-			}
-			if !humanRocket && conventions.HasIssueCommentReaction(ctx, s.gh, c.GetID(), "confused", true, bots, s.cfg.GitHubLogin) {
+			if !conventions.IssueCommentMarks(ctx, s.gh, c.GetID(), bots, s.cfg.GitHubLogin).Outstanding() {
 				continue
 			}
 			if isReviewer {
@@ -169,6 +173,13 @@ func (s *Scanner) evaluateComments(
 			}
 			if rc.GetCreatedAt().After(lastCommitTime) && rc.GetCreatedAt().After(lastCommentAddressedTime) && rc.GetCreatedAt().After(latestBotReplyTime) {
 				if conventions.HasIgnorePrefix(rc.GetBody(), s.cfg.TriggerLabel) {
+					continue
+				}
+				// Inline comments carry the same marks as conversation
+				// comments, and are read the same way: the watcher reacts to
+				// them when it picks them up, so ignoring what it wrote would
+				// make a failed attempt indistinguishable from a finished one.
+				if !conventions.ReviewCommentMarks(ctx, s.gh, rc.GetID(), bots, s.cfg.GitHubLogin).Outstanding() {
 					continue
 				}
 				if isInlineReviewer {

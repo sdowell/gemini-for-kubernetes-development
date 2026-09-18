@@ -94,6 +94,9 @@ FROM: {{ $review.UserLogin }}
 ## NEW FEEDBACK (Action Required)
 
 These are the comments since the last commit. You must address these.
+{{ if .Retry }}
+NOTE: This is attempt {{ .Retry }} at this feedback. A previous attempt was started and did not finish, so some of the feedback below may already have been dealt with, and its changes may already be committed and pushed. Check the current state of the code before making each change, and do not redo work that is already there.
+{{ end }}
 
 ### Issue Comments:
 {{ range  $comment := .IssueComments }}

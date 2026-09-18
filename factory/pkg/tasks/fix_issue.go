@@ -130,6 +130,11 @@ type AddressFeedbackParams struct {
 	PullRequestReviews    []PRReview
 	Models                []string
 	TriggerLabel          string
+	// Retry is the attempt number when a previous attempt at this same
+	// feedback failed, and zero otherwise. The agent is told, because a failed
+	// attempt may have committed and pushed part of the work before it died
+	// and the prompt would otherwise read as if nothing had been done.
+	Retry int
 }
 
 func GetAddressFeedbackScript() ([]byte, error) {

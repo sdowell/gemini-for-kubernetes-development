@@ -278,13 +278,11 @@ func (s *Scanner) evaluateAll(ctx context.Context, candidates []*githubv39.Issue
 	work := make(chan *githubv39.Issue)
 	var wg sync.WaitGroup
 	for i := 0; i < s.cfg.Workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for prIssue := range work {
 				s.evaluate(ctx, prIssue)
 			}
-		}()
+		})
 	}
 
 	for _, prIssue := range candidates {
@@ -421,10 +419,21 @@ func (s *Scanner) evaluate(ctx context.Context, prIssue *githubv39.Issue) {
 		prURL:                fmt.Sprintf("https://github.com/%s/%s/pull/%d", s.gh.Owner(), s.gh.Repo(), num),
 	}
 
+	// A failed address-comments task is outstanding work in its own right, and
+	// is checked for separately rather than left to the comment analysis.
+	//
+	// The analysis only looks at comments newer than the last commit and the
+	// last bot reply, and a failed attempt tends to leave both behind it: a
+	// commit it pushed before it died, and the comment announcing that it had
+	// started. Its feedback would then sit outside the window however clearly
+	// the reactions on it say it is still owed an answer.
+	failedComments := s.failedCommentsTask(num)
+	needsCommentWork := commentAnalysis.hasNewComments || failedComments != nil
+
 	// Top level case statement for handling each type of PR task
 	switch {
-	case commentAnalysis.hasNewComments:
-		s.handlePRComments(ctx, pc, commentAnalysis)
+	case needsCommentWork:
+		s.handlePRComments(ctx, pc, commentAnalysis, failedComments)
 
 	case isConflicting:
 		s.handlePRIterate(ctx, pc)
@@ -437,7 +446,7 @@ func (s *Scanner) evaluate(ctx context.Context, prIssue *githubv39.Issue) {
 		s.handlePRReview(ctx, pc, checkAnalysis.checkRuns)
 	}
 
-	s.reconcileReadiness(ctx, pc, checkAnalysis, commentAnalysis, history, isConflicting, assignedBot)
+	s.reconcileReadiness(ctx, pc, checkAnalysis, needsCommentWork, history, isConflicting, assignedBot)
 }
 
 // reconcileReadiness decides whether a pull request is ready for a human and
@@ -448,11 +457,15 @@ func (s *Scanner) evaluate(ctx context.Context, prIssue *githubv39.Issue) {
 // pull request. Reading that from the in-memory queue rather than from disk is
 // what stopped the label from flapping while a task file was being renamed
 // between directories.
+//
+// hasOutstandingFeedback covers both review feedback nobody has looked at yet
+// and feedback an attempt failed to address, because in neither case has the
+// pull request actually answered its reviewers.
 func (s *Scanner) reconcileReadiness(
 	ctx context.Context,
 	pc *prContext,
 	checkAnalysis prCheckAnalysis,
-	commentAnalysis prCommentAnalysis,
+	hasOutstandingFeedback bool,
 	history *prHistory,
 	isConflicting bool,
 	assignedBot string,
@@ -466,7 +479,7 @@ func (s *Scanner) reconcileReadiness(
 	isReadyForHuman := !isConflicting &&
 		!checkAnalysis.hasFailure &&
 		!checkAnalysis.hasPending &&
-		!commentAnalysis.hasNewComments &&
+		!hasOutstandingFeedback &&
 		!s.queue.HasActivePRTask(num) &&
 		reviewSatisfied &&
 		!conventions.HasStopLabel(pc.prIssue.Labels, s.cfg.TriggerLabel) &&

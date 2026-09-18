@@ -18,7 +18,7 @@ fi
 
 NAMESPACES=("$@")
 if [[ ${#NAMESPACES[@]} -eq 0 ]]; then
-    NAMESPACES=("overseer-system" "overseer-kcc")
+    NAMESPACES=("overseer-system" "overseer-overseer")
 fi
 
 echo "Verifying token against GitHub API..."

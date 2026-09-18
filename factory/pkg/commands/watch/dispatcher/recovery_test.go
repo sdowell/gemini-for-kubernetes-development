@@ -108,7 +108,7 @@ func TestRecover_AdoptedTaskFailureIsRecorded(t *testing.T) {
 
 func TestRecover_AlreadyCompletedTaskMovesToProcessed(t *testing.T) {
 	tempDir := t.TempDir()
-	d, queue, sandboxes, _, _ := testDispatcher(t, tempDir, nil)
+	d, queue, sandboxes, coordinator, _ := testDispatcher(t, tempDir, nil)
 	sandboxes.completed["sandbox"] = true
 
 	writeProcessingTask(t, tempDir, "task-issue-101.yaml", 101)
@@ -119,6 +119,13 @@ func TestRecover_AlreadyCompletedTaskMovesToProcessed(t *testing.T) {
 	waitForCounts(t, queue, 0, 0, 1)
 	if _, err := os.Stat(filepath.Join(tempDir, "processed", "task-issue-101.yaml")); err != nil {
 		t.Errorf("expected the task file in processed: %v", err)
+	}
+	// The run that started this task never saw it finish, so recovery is the
+	// only chance to record the outcome anywhere but the task file. For
+	// address-comments that record is the reaction on each comment, which
+	// would otherwise say the work is still in flight for ever.
+	if outcomes := coordinator.outcomes(); len(outcomes) != 1 || outcomes[0] != nil {
+		t.Errorf("outcomes = %v, want a single success notification", outcomes)
 	}
 	if d.sandboxLocks.IsBusy("sandbox") {
 		t.Error("expected no sandbox lease to be held for an already completed task")

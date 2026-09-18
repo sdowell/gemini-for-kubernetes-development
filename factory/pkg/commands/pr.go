@@ -14,6 +14,7 @@ import (
 
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/clients"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/common"
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/conventions"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/config"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/constants"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/envd"
@@ -309,6 +310,9 @@ type AddressCommentsFlags struct {
 	PRURL           string
 	Prompt          string
 	ContinueSession bool
+	// Retry is the attempt number when this run is re-doing work a previous
+	// run failed to finish, and zero on a first attempt. See runAddressComments.
+	Retry int
 }
 
 func NewAddressCommentsCommand(ctx context.Context) *cobra.Command {
@@ -350,18 +354,31 @@ func NewAddressCommentsCommand(ctx context.Context) *cobra.Command {
 
 			ctx, cancel := context.WithTimeout(ctx, rootFlags.Timeout)
 			defer cancel()
-			return runAddressComments(ctx, flags.PRURL, flags.Prompt, flags.ContinueSession, rootFlags.EphemeralStorage, rootFlags.ResolvedSecrets)
+			return runAddressComments(ctx, flags.PRURL, flags.Prompt, flags.ContinueSession, rootFlags.EphemeralStorage, rootFlags.ResolvedSecrets, flags.Retry)
 		},
 	}
 
 	cmd.Flags().StringVar(&flags.PRURL, "pr-url", "", "GitHub PR URL (e.g. https://github.com/owner/repo/pull/123)")
 	cmd.Flags().StringVar(&flags.Prompt, "prompt", "Address review feedback for this PR", "Custom prompt for the address-comments task")
 	cmd.Flags().BoolVar(&flags.ContinueSession, "continue-session", false, "Continue the Gemini session from previous runs in the sandbox")
+	cmd.Flags().IntVar(&flags.Retry, "retry", 0, "Attempt number when re-doing work a previous run failed to finish; makes feedback that is still unacknowledged on GitHub count as new")
 
 	return cmd
 }
 
-func runAddressComments(ctx context.Context, prURL, prompt string, continueSession bool, ephemeralStorage string, secrets []factorysandbox.SecretMount) error {
+// runAddressComments hands a pull request's outstanding review feedback to the
+// agent.
+//
+// retry is the attempt number, and is zero unless a previous attempt at the
+// same work failed. It matters because feedback is otherwise taken to be
+// outstanding when it was posted after the last commit, which is a fair reading
+// of a first attempt but not of a retry: the attempt that failed may well have
+// pushed a commit before it died, and the feedback it never answered would then
+// read as already handled. On a retry the acknowledgement reactions on GitHub -
+// which the watcher writes as it picks work up and finishes it - are consulted
+// instead, and anything they do not show as addressed is put back in front of
+// the agent.
+func runAddressComments(ctx context.Context, prURL, prompt string, continueSession bool, ephemeralStorage string, secrets []factorysandbox.SecretMount, retry int) error {
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		klog.Warningf("Failed to load factory config: %v", err)
@@ -410,6 +427,26 @@ func runAddressComments(ctx context.Context, prURL, prompt string, continueSessi
 		}
 	}
 
+	// On a retry the acknowledgement reactions decide what is still owed an
+	// answer. They are consulted only then: on a first attempt they would drag
+	// in every comment that was never acknowledged, including feedback from
+	// before any of this existed.
+	//
+	// The marks being read are the watcher's and not this process's, so there
+	// is no own account to exclude. A comment whose reactions cannot be read
+	// comes back unmarked and therefore unresolved, which errs towards handing
+	// the same feedback over twice rather than towards dropping it.
+	var allowlistedBots []string
+	if cfg != nil {
+		allowlistedBots = cfg.AllowlistedBots
+	}
+	unresolvedComment := func(id int64) bool {
+		return retry > 0 && conventions.IssueCommentMarks(ctx, repoClient, id, allowlistedBots, "").Unresolved()
+	}
+	unresolvedReviewComment := func(id int64) bool {
+		return retry > 0 && conventions.ReviewCommentMarks(ctx, repoClient, id, allowlistedBots, "").Unresolved()
+	}
+
 	// Fetch PR comments
 	comments, err := repoClient.ListIssueComments(ctx, prNum)
 	if err != nil {
@@ -424,7 +461,11 @@ func runAddressComments(ctx context.Context, prURL, prompt string, continueSessi
 			CreatedAt: c.GetCreatedAt().Format(time.RFC3339),
 			Body:      c.GetBody(),
 		}
-		if c.GetCreatedAt().After(lastCommitTime) {
+		// The last commit is the usual dividing line between feedback that has
+		// been answered and feedback that has not; a comment GitHub still shows
+		// as unresolved is on the unanswered side of it whatever its timestamp
+		// says.
+		if c.GetCreatedAt().After(lastCommitTime) || unresolvedComment(c.GetID()) {
 			newComments = append(newComments, cmt)
 		} else {
 			oldComments = append(oldComments, cmt)
@@ -444,10 +485,16 @@ func runAddressComments(ctx context.Context, prURL, prompt string, continueSessi
 			UserLogin: r.GetUser().GetLogin(),
 			Body:      r.GetBody(),
 		}
+		// A review and its inline comments are carried as a single block, so
+		// one unresolved inline comment brings its review along with it.
+		unresolved := false
 		// Fetch review comments for this review
 		revComments, err := repoClient.ListReviewComments(ctx, prNum, r.GetID())
 		if err == nil {
 			for _, rc := range revComments {
+				if unresolvedReviewComment(rc.GetID()) {
+					unresolved = true
+				}
 				rev.PullRequestComments = append(rev.PullRequestComments, tasks.PullRequestComment{
 					Path:     rc.GetPath(),
 					DiffHunk: rc.GetDiffHunk(),
@@ -455,7 +502,7 @@ func runAddressComments(ctx context.Context, prURL, prompt string, continueSessi
 				})
 			}
 		}
-		if r.GetSubmittedAt().After(lastCommitTime) {
+		if r.GetSubmittedAt().After(lastCommitTime) || unresolved {
 			newReviews = append(newReviews, rev)
 		} else {
 			oldReviews = append(oldReviews, rev)
@@ -505,6 +552,7 @@ func runAddressComments(ctx context.Context, prURL, prompt string, continueSessi
 		PullRequestReviews:    newReviews,
 		Models:                tasks.DefaultModels,
 		TriggerLabel:          triggerLabel,
+		Retry:                 retry,
 	}
 
 	scriptBytes, err := tasks.GetAddressFeedbackScript()
@@ -768,7 +816,10 @@ func runPRWatch(ctx context.Context, prURL string, interval time.Duration, dryRu
 					if dryRun {
 						fmt.Printf("[DRYRUN] Would trigger address-comments for PR #%d\n", prNum)
 					} else {
-						if err := runAddressComments(ctx, prURL, "Address review feedback for this PR", continueSession, ephemeralStorage, secrets); err != nil {
+						// The single-PR watch loop triggers off comments it has
+						// just seen, so every run is a first attempt; it keeps
+						// no record across runs to retry from.
+						if err := runAddressComments(ctx, prURL, "Address review feedback for this PR", continueSession, ephemeralStorage, secrets, 0); err != nil {
 							klog.Errorf("Address-comments failed: %v", err)
 						}
 					}

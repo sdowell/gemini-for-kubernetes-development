@@ -108,6 +108,16 @@ type QueueTask struct {
 	CommitSHA    string     `yaml:"commitSHA,omitempty"`
 	Instructions []string   `yaml:"instructions,omitempty"`
 	Recovered    bool       `yaml:"recovered,omitempty"`
+	// Retries is how many times this task has been re-queued after a previous
+	// attempt at the same work failed. Zero is the first attempt.
+	//
+	// It lives on the task rather than in the scanner's memory because the task
+	// file is the only record that survives a watcher restart, and a retry
+	// budget that resets on restart is not a budget. It is deliberately the
+	// *only* thing about a retry that is recorded here: what the retry has to
+	// cover is a question about the pull request, and is answered by the pull
+	// request itself.
+	Retries int `yaml:"retries,omitempty"`
 }
 
 // Duration returns the elapsed execution duration between StartedAt and CompletedAt,

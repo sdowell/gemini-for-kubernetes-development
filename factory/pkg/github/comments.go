@@ -90,3 +90,47 @@ func (c *Client) AddPullRequestCommentReaction(ctx context.Context, commentID in
 	}
 	return nil
 }
+
+// PullRequestCommentReactions returns the reactions recorded on a single inline
+// review comment.
+func (c *Client) PullRequestCommentReactions(ctx context.Context, commentID int64) ([]*githubv39.Reaction, error) {
+	if !c.Ready() {
+		return nil, errNoClient
+	}
+
+	reactions, _, err := c.gh.Reactions.ListPullRequestCommentReactions(ctx, c.owner, c.repo, commentID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("listing reactions on review comment %d: %w", commentID, err)
+	}
+	return reactions, nil
+}
+
+// RemoveIssueCommentReaction withdraws a reaction the caller previously
+// recorded on a conversation comment.
+//
+// Withdrawal exists because reactions are a set and not a log: GitHub keeps at
+// most one of each content per account, so a mark that is no longer true cannot
+// be superseded by writing a newer one - it has to be taken back.
+func (c *Client) RemoveIssueCommentReaction(ctx context.Context, commentID, reactionID int64) error {
+	if !c.Ready() {
+		return errNoClient
+	}
+
+	if _, err := c.gh.Reactions.DeleteIssueCommentReaction(ctx, c.owner, c.repo, commentID, reactionID); err != nil {
+		return fmt.Errorf("removing reaction %d from comment %d: %w", reactionID, commentID, err)
+	}
+	return nil
+}
+
+// RemovePullRequestCommentReaction withdraws a reaction the caller previously
+// recorded on an inline review comment.
+func (c *Client) RemovePullRequestCommentReaction(ctx context.Context, commentID, reactionID int64) error {
+	if !c.Ready() {
+		return errNoClient
+	}
+
+	if _, err := c.gh.Reactions.DeletePullRequestCommentReaction(ctx, c.owner, c.repo, commentID, reactionID); err != nil {
+		return fmt.Errorf("removing reaction %d from review comment %d: %w", reactionID, commentID, err)
+	}
+	return nil
+}

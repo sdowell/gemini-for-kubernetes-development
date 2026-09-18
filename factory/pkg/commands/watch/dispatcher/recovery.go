@@ -63,11 +63,24 @@ func (d *Dispatcher) recoverTask(ctx context.Context, filename string, task *api
 			if err := d.queue.CompleteTask(filename, task); err != nil {
 				klog.Errorf("Failed to complete recovered task %s: %v", filename, err)
 			}
+			// The outcome is announced here as it would have been had the
+			// previous run lived to see it. Nothing else will: the work is
+			// finished, so no later run reaches this task again, and a task
+			// whose completion was never recorded on GitHub leaves the
+			// acknowledgements on its comments saying it is still in flight.
+			d.coordinator.NotifyTaskFinished(ctx, task, nil)
 			return
 		}
 	}
 
 	// The sandbox is gone or never ran the task: requeue it for a fresh attempt.
+	//
+	// The retry count is deliberately left alone. It counts attempts that
+	// failed on their own terms, and is the same field the scanners read to
+	// decide when to give up and hand a pull request back to a human - a count
+	// raised from here would reach that limit without anything having
+	// announced why, and stop the work silently. A sandbox that keeps
+	// disappearing is an operator's problem, not a reviewer's.
 	task.Status = api.StatusPending
 	task.Recovered = true
 	if err := d.queue.Enqueue(filename, task); err != nil {
