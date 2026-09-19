@@ -741,3 +741,82 @@ func TestRun_DrainCancelsTasksThatOutlastGracePeriod(t *testing.T) {
 		t.Errorf("expected no finish notification for a task cut short by shutdown, got %v", outcomes)
 	}
 }
+
+// An adopted task is supervised on the dispatcher's worker context, not the dispatch
+// loop's, so stopping the loop leaves the monitor free to record the real outcome.
+func TestRun_DrainLetsAdoptedTaskFinishAfterShutdown(t *testing.T) {
+	tempDir := t.TempDir()
+	d, queue, sandboxes, coordinator, _ := testDispatcher(t, tempDir, func(cfg *Config, _ *Deps) {
+		cfg.AdoptionPollInterval = 5 * time.Millisecond
+		cfg.ShutdownGracePeriod = 10 * time.Second
+	})
+	sandboxes.running["sandbox"] = true
+
+	// Run adopts the task left behind in processing as it starts.
+	writeProcessingTask(t, tempDir, "task-issue-14.yaml", 14)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := runDispatcher(ctx, d)
+
+	waitForSandboxLease(t, d, "sandbox")
+	cancel()
+
+	// The dispatch loop is stopping, but the sandbox carries on and finishes.
+	time.Sleep(20 * time.Millisecond)
+	sandboxes.mu.Lock()
+	sandboxes.running["sandbox"] = false
+	sandboxes.completed["sandbox"] = true
+	sandboxes.mu.Unlock()
+
+	awaitRunReturn(t, runDone)
+
+	waitForCounts(t, queue, 0, 0, 1)
+	if outcomes := coordinator.outcomes(); len(outcomes) != 1 || outcomes[0] != nil {
+		t.Errorf("expected the drained adopted task to report success, got %v", outcomes)
+	}
+}
+
+// ...and it is cancelled by the same grace period that cancels dispatched workers,
+// rather than outliving the dispatcher or dying the moment the loop stops.
+func TestRun_DrainCancelsAdoptedTaskThatOutlastsGracePeriod(t *testing.T) {
+	tempDir := t.TempDir()
+	d, queue, sandboxes, coordinator, _ := testDispatcher(t, tempDir, func(cfg *Config, _ *Deps) {
+		cfg.AdoptionPollInterval = 5 * time.Millisecond
+		cfg.ShutdownGracePeriod = 50 * time.Millisecond
+	})
+	// The sandbox never stops, so only cancellation can end the monitor.
+	sandboxes.running["sandbox"] = true
+
+	writeProcessingTask(t, tempDir, "task-issue-15.yaml", 15)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := runDispatcher(ctx, d)
+
+	waitForSandboxLease(t, d, "sandbox")
+	cancel()
+	awaitRunReturn(t, runDone)
+
+	// Same contract as a dispatched worker: no verdict is recorded, and the task is
+	// left in processing for the next run to adopt again.
+	waitForCounts(t, queue, 0, 1, 0)
+	if outcomes := coordinator.outcomes(); len(outcomes) != 0 {
+		t.Errorf("expected no finish notification for an adopted task cut short by shutdown, got %v", outcomes)
+	}
+	if d.sandboxLocks.IsBusy("sandbox") {
+		t.Error("expected the sandbox lease to be released once the monitor was cancelled")
+	}
+}
+
+// waitForSandboxLease blocks until the named sandbox has been leased, which is how a
+// test knows adoption has actually started.
+func waitForSandboxLease(t *testing.T, d *Dispatcher, sandboxName string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if d.sandboxLocks.IsBusy(sandboxName) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for sandbox %s to be leased", sandboxName)
+}

@@ -158,6 +158,10 @@ func (d *Dispatcher) probeSandbox(ctx context.Context, sandboxName string, taskT
 
 // adoptTask takes ownership of a task that is still executing in its sandbox by
 // holding the sandbox lease and supervising the task until it finishes.
+//
+// An adopted task is an in-flight task like any other, so its monitor is spawned the
+// same way a dispatched worker is: same waitgroup, same worker context, and therefore
+// the same grace period when the dispatcher shuts down.
 func (d *Dispatcher) adoptTask(ctx context.Context, filename string, task *api.QueueTask, sandboxName string) {
 	if !d.sandboxLocks.TryAcquire(sandboxName, filename) {
 		klog.Infof("Task %s is still actively running in sandbox %s. Failed to acquire lease.", filename, sandboxName)
@@ -165,13 +169,15 @@ func (d *Dispatcher) adoptTask(ctx context.Context, filename string, task *api.Q
 	}
 
 	klog.Infof("Task %s is still actively running in sandbox %s. Adopting task.", filename, sandboxName)
+	monitorCtx := d.workerContext(ctx)
+
 	d.wg.Add(1)
 	go func() {
 		defer func() {
 			d.sandboxLocks.Release(sandboxName, filename)
 			d.wg.Done()
 		}()
-		d.monitorAdoptedTask(ctx, filename, task, sandboxName)
+		d.monitorAdoptedTask(monitorCtx, filename, task, sandboxName)
 	}()
 }
 

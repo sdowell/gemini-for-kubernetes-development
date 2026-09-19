@@ -155,12 +155,12 @@ func New(cfg Config, deps Deps) *Dispatcher {
 	}
 }
 
-// Run executes the dispatch loop until ctx is cancelled.
-// It dispatches immediately, then once per configured interval.
+// Run recovers tasks left behind by a previous run, then executes the dispatch loop
+// until ctx is cancelled. It dispatches immediately, then once per configured interval.
 //
 // Cancelling ctx stops new tasks being claimed but does not abort tasks already
 // running: those are given ShutdownGracePeriod to finish. Run waits for all
-// in-flight tasks to settle before returning.
+// in-flight tasks to settle before returning, adopted ones included.
 func (d *Dispatcher) Run(ctx context.Context) error {
 	// Task workloads run detached inside their sandbox, so a worker that loses its
 	// context stops supervising work that carries on regardless. Give workers a
@@ -173,6 +173,12 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 
 	defer cancelTasks()
 	defer d.wg.Wait()
+
+	// Recovery is the dispatcher's own first act rather than something a caller does
+	// beforehand, and it has to happen after the worker context exists: a task adopted
+	// here is supervised exactly like a dispatched one, so it must run under the same
+	// context and be drained by the same shutdown.
+	d.Recover(ctx)
 
 	d.DispatchOnce(ctx)
 
@@ -203,6 +209,7 @@ func (d *Dispatcher) Wait() {
 // whole point of draining: the workload is still running in its sandbox whether or
 // not this process is watching. Tasks that outlast the grace period are cancelled,
 // and executeTask then leaves them in the processing queue for the next run to adopt.
+// Adopted tasks are supervised on the same context, so they drain the same way.
 func (d *Dispatcher) drain() {
 	done := make(chan struct{})
 	go func() {
@@ -233,11 +240,13 @@ func (d *Dispatcher) cancelInFlightTasks() {
 	}
 }
 
-// workerContext returns the context a newly dispatched task worker should run under.
+// workerContext returns the context a task worker should run under, whether it was
+// dispatched from the queue or adopted from a sandbox that was already running it.
 //
-// Run installs a context detached from the dispatch loop. Callers that drive
-// DispatchOnce directly (one-shot runs and tests) keep the caller's context, so
-// cancelling it still aborts their tasks.
+// Run installs a context detached from the dispatch loop, so every worker it owns
+// shares one cancellation. Callers that drive DispatchOnce or Recover directly
+// (one-shot runs and tests) keep the caller's context, so cancelling it still aborts
+// their tasks.
 func (d *Dispatcher) workerContext(ctx context.Context) context.Context {
 	d.taskCtxMu.RLock()
 	defer d.taskCtxMu.RUnlock()

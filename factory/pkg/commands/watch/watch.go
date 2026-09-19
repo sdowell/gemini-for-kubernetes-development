@@ -36,6 +36,9 @@ func (w *Watcher) Run(ctx context.Context) error {
 		}
 		w.reconciler.CollectGarbage(ctx)
 		if w.Mode == "all" || w.Mode == "run" {
+			// The dispatch loop is what normally recovers; a one-shot run has to ask
+			// for it. Its workers stay on ctx, so interrupting the run still stops them.
+			w.dispatcher.Recover(ctx)
 			w.dispatcher.DispatchOnce(ctx)
 		}
 		fmt.Println("Running in once mode. Waiting for active tasks to complete...")
@@ -204,9 +207,9 @@ func (w *Watcher) init(ctx context.Context) error {
 		klog.Warningf("Failed to load queue tasks from disk: %v", err)
 	}
 
-	// Recovery: Reconcile any leftover tasks in processingDir on startup, adopting
-	// tasks that are still running inside their sandbox.
-	w.dispatcher.Recover(ctx)
+	// Recovery is not done here: it belongs to the dispatcher, which reconciles
+	// leftover processing tasks as it starts. A watcher that does not dispatch must
+	// not adopt tasks, because the queue directory may be shared with one that does.
 
 	return nil
 }
