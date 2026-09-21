@@ -33,6 +33,31 @@ type prState struct {
 	lastIteratedSHA string
 	// lastIteratedTime is when a rebase was last queued or completed.
 	lastIteratedTime time.Time
+
+	// The three fields below record what the last *complete* evaluation saw,
+	// and exist for the fast pass's skip gate (see Scanner.needsEvaluation).
+	// They are set only when an evaluation runs all the way through, so a
+	// pull request abandoned half way - a failed history fetch, a merge queue
+	// bail-out - is never mistaken for one that has been fully accounted for.
+	//
+	// Unlike the fields above they are not recovered from the queue on
+	// startup, and that is deliberate: a fresh process has no idea what has
+	// happened while it was down, so every pull request earns one full
+	// evaluation before it can be skipped.
+
+	// lastEvaluatedUpdatedAt is the pull request's updated_at at that
+	// evaluation. A zero value means it has never been evaluated in this
+	// process.
+	lastEvaluatedUpdatedAt time.Time
+	// lastEvaluationActive records whether CI was pending or failing. Neither
+	// a check run completing nor a re-run being dispatched moves updated_at,
+	// so a pull request mid-CI cannot be skipped on that timestamp alone.
+	lastEvaluationActive bool
+	// lastEvaluationHadTask records whether a task for this pull request was
+	// queued or running. The transition out of that state is what makes a
+	// pull request ready for a human, and it is invisible in updated_at when
+	// the task finished without pushing anything.
+	lastEvaluationHadTask bool
 }
 
 // stateStore holds the per-pull-request gating state.

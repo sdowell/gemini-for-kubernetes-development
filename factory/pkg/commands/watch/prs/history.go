@@ -39,6 +39,12 @@ type prHistory struct {
 // towards silently skipping it. A failure to list comments or reviews is not:
 // without them the scanner cannot tell whether feedback is outstanding, and
 // acting on that blank picture would queue the wrong task.
+//
+// The inline comments are read for the whole pull request in one call and
+// grouped by review here, rather than fetched per review. Both spellings
+// return the same thing, but the per-review one costs a request each, so its
+// price rose with every review a pull request had ever received - which on a
+// long-lived change was the single largest term in the cost of evaluating it.
 func (s *Scanner) fetchHistory(ctx context.Context, num int) (*prHistory, error) {
 	h := &prHistory{revCommentsMap: make(map[int64][]*githubv39.PullRequestComment)}
 
@@ -61,9 +67,21 @@ func (s *Scanner) fetchHistory(ctx context.Context, num int) (*prHistory, error)
 		return nil, fmt.Errorf("listing reviews: %w", err)
 	}
 
-	for _, r := range h.reviews {
-		if rc, err := s.gh.ListReviewComments(ctx, num, r.GetID()); err == nil {
-			h.revCommentsMap[r.GetID()] = rc
+	// A failure here is tolerated for the same reason the commit listing is:
+	// the inline comments refine the picture of what has been asked for, and an
+	// empty map makes the scanner act on the top-level conversation alone
+	// rather than abandon the evaluation.
+	revComments, err := s.gh.ListAllReviewComments(ctx, num)
+	if err != nil {
+		klog.Warningf("Failed to list review comments for PR #%d: %v", num, err)
+		return h, nil
+	}
+	for _, rc := range revComments {
+		// A comment with no review behind it is not addressable as review
+		// feedback - every consumer of this map looks a review up by ID - so it
+		// is dropped rather than collected under the zero key.
+		if id := rc.GetPullRequestReviewID(); id != 0 {
+			h.revCommentsMap[id] = append(h.revCommentsMap[id], rc)
 		}
 	}
 
