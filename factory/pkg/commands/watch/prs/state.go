@@ -43,9 +43,12 @@ type prState struct {
 // and putting single-owner bookkeeping there would make it look shared when it
 // is not.
 //
-// The mutex is needed because the scanner evaluates pull requests on a worker
-// pool. Contention is not a concern - the critical sections are map lookups
-// between GitHub round trips.
+// The mutex outlives the worker pool it was originally added for: pull requests
+// are now evaluated one at a time, so the store has a single writer again. It
+// is kept because an uncontended lock costs nothing here - the critical
+// sections are map lookups between GitHub round trips - and because it is the
+// one thing that would have to be reintroduced, correctly, if evaluation were
+// ever parallelised again.
 type stateStore struct {
 	mu sync.Mutex
 	// queue is where the finished tasks are recovered from. The scanner does

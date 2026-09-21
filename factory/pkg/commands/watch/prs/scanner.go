@@ -6,16 +6,18 @@
 // Evaluating one pull request costs the better part of a dozen GitHub requests
 // (commits, comments, reviews, inline review comments, check runs, commit
 // statuses, merge queue state), which is what made this the slowest part of the
-// daemon and the reason it now runs as its own goroutine: nothing else has to
-// wait behind it. Within a cycle the pull requests are evaluated on a bounded
-// worker pool, so one slow pull request no longer holds up the rest.
+// daemon and the reason it runs as its own goroutine: nothing else has to wait
+// behind it. Within a cycle the pull requests are evaluated one at a time. The
+// concurrency this package used to have was traded away deliberately: on a busy
+// repository the burst of parallel requests was what pushed the deployment into
+// its GitHub rate limit, and a scanner that is throttled evaluates nothing at
+// all. Latency is recovered by the cycle cadence, not by fanning out.
 package prs
 
 import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	githubv39 "github.com/google/go-github/v39/github"
@@ -27,23 +29,23 @@ import (
 )
 
 const (
-	// DefaultInterval is how often the pull requests assigned to the bot pool
-	// are evaluated. Those are the ones with work in flight, and the listing
-	// behind them is a single page per bot account.
-	DefaultInterval = 1 * time.Minute
-	// DefaultSweepInterval is how often every pull request the watcher is
-	// responsible for is evaluated, and the open PR cache refreshed.
+	// DefaultInterval is how long the scanner waits after finishing a cycle
+	// before starting the next pass over the pull requests assigned to the bot
+	// pool. Those are the ones with work in flight, and the listing behind them
+	// is a single page per bot account - but each candidate it turns up still
+	// costs a dozen requests to evaluate, which is why the wait is measured in
+	// minutes rather than seconds.
+	DefaultInterval = 5 * time.Minute
+	// DefaultSweepInterval is how long after a full sweep the next one may
+	// start. A sweep evaluates every pull request the watcher is responsible
+	// for and refreshes the open PR cache.
 	//
 	// Evaluation cost scales with the number of open pull requests, at roughly
 	// a dozen requests each, so this interval is what keeps a busy repository
 	// inside its hourly GitHub rate limit. Shortening it is not a free latency
 	// win: the fast pass above already covers the pull requests that have work
 	// in flight.
-	DefaultSweepInterval = 5 * time.Minute
-	// DefaultWorkers is how many pull requests are evaluated concurrently.
-	// The pool bounds the burst of GitHub requests a cycle can produce while
-	// still keeping one slow pull request from delaying the others.
-	DefaultWorkers = 2
+	DefaultSweepInterval = 30 * time.Minute
 	// defaultScanLimit bounds the fast query when no limit is configured.
 	defaultScanLimit = 30
 )
@@ -93,13 +95,12 @@ type Sandboxes interface {
 
 // Config holds the tuning knobs of a Scanner.
 type Config struct {
-	// Interval is the delay between fast cycles over assigned pull requests.
-	// Defaults to DefaultInterval.
+	// Interval is how long to wait after a cycle finishes before running the
+	// next fast pass over assigned pull requests. Defaults to DefaultInterval.
 	Interval time.Duration
-	// SweepInterval is the delay between full sweeps. Defaults to DefaultSweepInterval.
+	// SweepInterval is how long after a sweep finishes the next one may start.
+	// Defaults to DefaultSweepInterval.
 	SweepInterval time.Duration
-	// Workers is the size of the evaluation pool. Defaults to DefaultWorkers.
-	Workers int
 	// TriggerLabel is the label marking a pull request as the watcher's to work on.
 	TriggerLabel string
 	// GitHubLogin is the watcher's own account, whose comments are never
@@ -161,11 +162,9 @@ type Scanner struct {
 	// so no call site has to restate whose marks count as the watcher's.
 	reactions *conventions.ReactionInterpreter
 
-	// state records what has already been done for each pull request. Unlike
-	// the other subcontrollers' bookkeeping it is mutex-guarded, because the
-	// worker pool evaluates several pull requests at once.
+	// state records what has already been done for each pull request.
 	state *stateStore
-	// lastSweep is when the full sweep last ran.
+	// lastSweep is when the full sweep last finished.
 	lastSweep time.Time
 }
 
@@ -176,9 +175,6 @@ func New(cfg Config, deps Deps) *Scanner {
 	}
 	if cfg.SweepInterval <= 0 {
 		cfg.SweepInterval = DefaultSweepInterval
-	}
-	if cfg.Workers <= 0 {
-		cfg.Workers = DefaultWorkers
 	}
 	if cfg.ScanLimit <= 0 {
 		cfg.ScanLimit = defaultScanLimit
@@ -200,20 +196,25 @@ func New(cfg Config, deps Deps) *Scanner {
 //
 // A cycle runs immediately so that a restart picks up the pull requests that
 // changed while the daemon was down, instead of waiting out a full interval.
+//
+// The interval is then measured from the end of a cycle rather than from its
+// start. A cycle that ran long is one that spent a lot of GitHub requests -
+// usually because it was being throttled - and a fixed-rate ticker would answer
+// that by firing the next cycle the instant the slow one returned, or by having
+// one queued up already. Waiting the full interval after the work is done is
+// what keeps the scanner's request rate bounded no matter how slow GitHub is.
 func (s *Scanner) Run(ctx context.Context) error {
-	ticker := time.NewTicker(s.cfg.Interval)
-	defer ticker.Stop()
-
-	s.ScanOnce(ctx)
-
 	for {
+		s.ScanOnce(ctx)
+
+		timer := time.NewTimer(s.cfg.Interval)
 		select {
 		case <-ctx.Done():
 			// Cancellation is how this subcontroller is asked to stop, so it is
 			// not an error worth propagating to the caller.
+			timer.Stop()
 			return nil
-		case <-ticker.C:
-			s.ScanOnce(ctx)
+		case <-timer.C:
 		}
 	}
 }
@@ -241,7 +242,6 @@ func (s *Scanner) ScanOnce(ctx context.Context) {
 // the watcher is responsible for.
 func (s *Scanner) sweep(ctx context.Context) {
 	klog.Infof("Running full PR scan cycle...")
-	s.lastSweep = time.Now()
 
 	// Publish the open pull requests first: the issue scanner reads the
 	// referenced-issue map derived from them to tell which issues already have
@@ -260,6 +260,11 @@ func (s *Scanner) sweep(ctx context.Context) {
 		klog.Errorf("Failed to scan PR issues: %v", err)
 	}
 	s.evaluateAll(ctx, candidates)
+
+	// Stamped on the way out, not on the way in: a sweep over a large
+	// repository can itself take minutes, and dating it from its start would
+	// let the next one begin almost immediately behind a slow one.
+	s.lastSweep = time.Now()
 }
 
 // fastPass evaluates the pull requests currently assigned to the bot pool,
@@ -277,43 +282,23 @@ func (s *Scanner) fastPass(ctx context.Context) {
 	s.evaluateAll(ctx, candidates)
 }
 
-// evaluateAll evaluates the candidates on a bounded worker pool and returns
-// once every one of them has been handled.
+// evaluateAll evaluates the candidates one at a time and returns once every one
+// of them has been handled, or once the context is cancelled.
 //
-// The pool is what keeps a pull request whose comment history takes ten seconds
-// to page from delaying every pull request behind it. Each candidate appears at
-// most once per cycle, so no two workers ever touch the same pull request's
-// state.
+// Serial by design. Evaluating a pull request costs roughly a dozen GitHub
+// requests, so a pool only compresses those requests into a shorter window: it
+// does not reduce them, and on a repository with many open pull requests the
+// burst is what exhausts the rate limit. A scanner that gets throttled makes
+// every pull request slow, which is a worse outcome than the head-of-line
+// delay the pool was there to avoid.
 func (s *Scanner) evaluateAll(ctx context.Context, candidates []*githubv39.Issue) {
-	if len(candidates) == 0 {
-		return
-	}
-
-	work := make(chan *githubv39.Issue)
-	var wg sync.WaitGroup
-	for i := 0; i < s.cfg.Workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for prIssue := range work {
-				s.evaluate(ctx, prIssue)
-			}
-		}()
-	}
-
 	for _, prIssue := range candidates {
-		select {
-		case <-ctx.Done():
-			// Stop feeding the pool on shutdown; the workers drain what they
-			// already took and the next run picks the rest up.
-			close(work)
-			wg.Wait()
+		if ctx.Err() != nil {
+			// Stop on shutdown; the next run picks up what is left.
 			return
-		case work <- prIssue:
 		}
+		s.evaluate(ctx, prIssue)
 	}
-	close(work)
-	wg.Wait()
 }
 
 // evaluate decides what a single pull request needs and queues it.

@@ -30,15 +30,18 @@ import (
 )
 
 const (
-	// DefaultInterval is how often the issues assigned to the bot pool or
-	// created by the operator are scanned. It is what sets pickup latency for a
-	// new issue, and the queries behind it are bounded to a single page.
-	DefaultInterval = 30 * time.Second
-	// DefaultSweepInterval is how often the full trigger-labelled sweep runs.
-	// That sweep paginates over every labelled issue in the repository, so it
-	// stays on the slow cadence it has always had; the fast cycle above is what
-	// picks up the issues a person just filed or assigned.
-	DefaultSweepInterval = 5 * time.Minute
+	// DefaultInterval is how long the scanner waits after finishing a cycle
+	// before scanning again for issues assigned to the bot pool or created by
+	// the operator. It is what sets pickup latency for a new issue, and the
+	// queries behind it are bounded to a single page - but every candidate they
+	// return costs a timeline listing and a linked-PR check on top, so the wait
+	// is what keeps a busy repository inside its hourly GitHub rate limit.
+	DefaultInterval = 2 * time.Minute
+	// DefaultSweepInterval is how long after a full trigger-labelled sweep the
+	// next one may start. That sweep paginates over every labelled issue in the
+	// repository, so it stays on a slower cadence than the fast cycle above,
+	// which is what picks up the issues a person just filed or assigned.
+	DefaultSweepInterval = 15 * time.Minute
 	// defaultScanLimit bounds the fast queries when no limit is configured.
 	defaultScanLimit = 30
 )
@@ -196,20 +199,25 @@ func New(cfg Config, deps Deps) *Scanner {
 //
 // A cycle runs immediately so that a restart picks up the issues filed while
 // the daemon was down, instead of waiting out a full interval.
+//
+// The interval is then measured from the end of a cycle rather than from its
+// start. A cycle that ran long is one that spent a lot of GitHub requests -
+// usually because it was being throttled - and a fixed-rate ticker would answer
+// that by firing the next cycle the instant the slow one returned, or by having
+// one queued up already. Waiting the full interval after the work is done is
+// what keeps the scanner's request rate bounded no matter how slow GitHub is.
 func (s *Scanner) Run(ctx context.Context) error {
-	ticker := time.NewTicker(s.cfg.Interval)
-	defer ticker.Stop()
-
-	s.ScanOnce(ctx)
-
 	for {
+		s.ScanOnce(ctx)
+
+		timer := time.NewTimer(s.cfg.Interval)
 		select {
 		case <-ctx.Done():
 			// Cancellation is how this subcontroller is asked to stop, so it is
 			// not an error worth propagating to the caller.
+			timer.Stop()
 			return nil
-		case <-ticker.C:
-			s.ScanOnce(ctx)
+		case <-timer.C:
 		}
 	}
 }

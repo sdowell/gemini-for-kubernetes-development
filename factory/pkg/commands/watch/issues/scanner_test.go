@@ -515,3 +515,55 @@ func TestRun_StopsOnContextCancellation(t *testing.T) {
 		t.Fatal("Run() did not return within 5s of cancellation")
 	}
 }
+
+// TestRun_WaitsForIntervalAfterCycleCompletes pins the back-off the rate limit
+// forced on us: the wait starts when a cycle finishes, not when it starts.
+//
+// A fixed-rate ticker would put the cycles one interval apart no matter how
+// long each took - and for a cycle that overran the interval, back to back -
+// which is the opposite of what a scanner being throttled by GitHub should do.
+// The evidence is the gap between consecutive cycles: it must cover the work
+// *and* the interval.
+func TestRun_WaitsForIntervalAfterCycleCompletes(t *testing.T) {
+	const (
+		cycleDuration = 200 * time.Millisecond
+		interval      = 150 * time.Millisecond
+	)
+
+	var mu sync.Mutex
+	var starts []time.Time
+
+	// Paused is read at the top of a cycle, which makes it both the clock and
+	// the stand-in for a slow cycle: the scan returns as soon as it reports
+	// true, so the sleep here is the whole of the cycle's duration.
+	paused := func() bool {
+		mu.Lock()
+		starts = append(starts, time.Now())
+		mu.Unlock()
+		time.Sleep(cycleDuration)
+		return true
+	}
+
+	s, _, _ := newScanner(t, Config{Interval: interval}, Deps{Paused: paused})
+
+	// Long enough for three cycles at the end-to-start cadence, and for at
+	// least four at the fixed-rate one this is here to rule out.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*(cycleDuration+interval))
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatalf("Run() = %v, want nil", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(starts) < 2 {
+		t.Fatalf("ran %d cycles, want at least 2 to measure a gap", len(starts))
+	}
+	for i := 1; i < len(starts); i++ {
+		gap := starts[i].Sub(starts[i-1])
+		if gap < cycleDuration+interval {
+			t.Errorf("cycle %d started %v after cycle %d, want at least %v (the cycle plus the interval)",
+				i, gap, i-1, cycleDuration+interval)
+		}
+	}
+}
