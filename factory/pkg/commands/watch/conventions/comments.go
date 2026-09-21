@@ -60,7 +60,17 @@ func ResolveCommentReactions(ctx context.Context, client CommentResolverClient, 
 		if ShouldIgnoreUser(c.GetUser(), selfLogin, bots) {
 			continue
 		}
-		if !interpreter.CommentState(ctx, c.GetID()).Acknowledged {
+		state, err := interpreter.CommentState(ctx, c.GetID())
+		if err != nil {
+			// Reading one comment's reactions failing means the next one's
+			// will too - the usual cause is the quota, which is per-account
+			// and not per-comment. Walking the rest of the thread would spend
+			// a request per comment to learn the same thing, so the remaining
+			// acknowledgements are left for the next task to close out.
+			klog.Warningf("Stopped resolving reactions on PR #%d: %v", prNum, err)
+			return
+		}
+		if !state.Acknowledged {
 			continue
 		}
 		if err := client.AddIssueCommentReaction(ctx, c.GetID(), string(resolution)); err != nil {

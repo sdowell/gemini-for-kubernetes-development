@@ -127,6 +127,10 @@ func TestEvaluate_ReadyForHuman_GatedByActiveTask(t *testing.T) {
 			unassignCalls = append(unassignCalls, strings.TrimSpace(string(bodyBytes)))
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{})
+		case isReadReactionsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.Reaction{})
+		case isReviewCommentsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.PullRequestComment{})
 		default:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("{}"))
@@ -258,6 +262,10 @@ func TestEvaluate_UnassignOnReadyForHuman(t *testing.T) {
 			unassignCalls = append(unassignCalls, strings.TrimSpace(string(bodyBytes)))
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{})
+		case isReadReactionsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.Reaction{})
+		case isReviewCommentsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.PullRequestComment{})
 		default:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("{}"))
@@ -367,6 +375,10 @@ func TestEvaluate_ReadyForHuman_GatedByPendingCheckRuns(t *testing.T) {
 		case r.Method == "DELETE" && r.URL.Path == "/repos/test-owner/test-repo/issues/10/assignees":
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{})
+		case isReadReactionsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.Reaction{})
+		case isReviewCommentsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.PullRequestComment{})
 		default:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("{}"))
@@ -480,6 +492,10 @@ func TestEvaluate_ReadyForHuman_GatedByPendingCommitStatus(t *testing.T) {
 		case r.Method == "DELETE" && r.URL.Path == "/repos/test-owner/test-repo/issues/10/assignees":
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{})
+		case isReadReactionsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.Reaction{})
+		case isReviewCommentsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.PullRequestComment{})
 		default:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("{}"))
@@ -580,6 +596,10 @@ func TestEvaluate_Review_GatedByPendingCheckRuns(t *testing.T) {
 		case r.Method == "DELETE" && r.URL.Path == "/repos/test-owner/test-repo/issues/10/assignees":
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{})
+		case isReadReactionsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.Reaction{})
+		case isReviewCommentsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.PullRequestComment{})
 		default:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("{}"))
@@ -698,6 +718,10 @@ func TestEvaluate_CommentsPrioritizedOverCIFailures(t *testing.T) {
 			_ = json.NewEncoder(w).Encode([]*githubv39.RepoStatus{})
 		case r.Method == "POST" && strings.Contains(r.URL.Path, "/reactions"):
 			_ = json.NewEncoder(w).Encode(&githubv39.Reaction{Content: stringPtr("eyes")})
+		case isReadReactionsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.Reaction{})
+		case isReviewCommentsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.PullRequestComment{})
 		default:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{}`))
@@ -817,6 +841,10 @@ func TestEvaluate_CommentsPrioritizedOverMergeConflicts(t *testing.T) {
 			_ = json.NewEncoder(w).Encode([]*githubv39.PullRequestReview{})
 		case r.Method == "POST" && strings.Contains(r.URL.Path, "/reactions"):
 			_ = json.NewEncoder(w).Encode(&githubv39.Reaction{Content: stringPtr("eyes")})
+		case isReadReactionsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.Reaction{})
+		case isReviewCommentsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.PullRequestComment{})
 		default:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{}`))
@@ -912,6 +940,10 @@ func TestEvaluate_InMergeQueue(t *testing.T) {
 					}
 				}
 			}`))
+		case isReadReactionsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.Reaction{})
+		case isReviewCommentsRequest(r):
+			_ = json.NewEncoder(w).Encode([]*githubv39.PullRequestComment{})
 		default:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("{}"))

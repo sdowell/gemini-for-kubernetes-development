@@ -9,6 +9,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/conventions"
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/github"
 )
 
 // scanLabelled lists every open issue carrying the trigger label, following
@@ -18,6 +19,11 @@ import (
 //
 // Pull requests are dropped: GitHub's issue endpoints return them alongside
 // issues, and they belong to the pull request scanner.
+//
+// Nothing is returned alongside an error. What was paged in before the failure
+// is a prefix of the labelled set, and the caller publishes this list as the
+// complete picture of the open issues - a truncated one would have the sandbox
+// reconciler garbage collect the issues that never got listed.
 func (s *Scanner) scanLabelled(ctx context.Context) ([]*githubv39.Issue, error) {
 	var labelled []*githubv39.Issue
 	opts := &githubv39.IssueListByRepoOptions{
@@ -28,9 +34,7 @@ func (s *Scanner) scanLabelled(ctx context.Context) ([]*githubv39.Issue, error) 
 	for {
 		pageIssues, resp, err := s.gh.ListIssues(ctx, opts)
 		if err != nil {
-			// Whatever was paged in so far is still returned: the caller queues
-			// from it but must not publish it as the complete open set.
-			return labelled, err
+			return nil, fmt.Errorf("listing issues for label %s: %w", s.cfg.TriggerLabel, err)
 		}
 		for _, item := range pageIssues {
 			if item.PullRequestLinks == nil {
@@ -52,6 +56,9 @@ func (s *Scanner) scanLabelled(ctx context.Context) ([]*githubv39.Issue, error) 
 // Each query is a single page sorted by update time, which is what makes this
 // cheap enough to run every interval. An issue that falls off the first page
 // has not been touched recently and is picked up by the labelled sweep.
+//
+// One account failing ends the pass. The accounts share a quota, so whatever
+// refused the first will refuse the rest.
 func (s *Scanner) scanAssigned(ctx context.Context) ([]*githubv39.Issue, error) {
 	var allItems []*githubv39.Issue
 
@@ -64,8 +71,7 @@ func (s *Scanner) scanAssigned(ctx context.Context) ([]*githubv39.Issue, error) 
 			ListOptions: githubv39.ListOptions{PerPage: s.cfg.ScanLimit},
 		})
 		if err != nil {
-			klog.Errorf("Failed to list issues for assignee %s: %v", botUser, err)
-			continue
+			return nil, fmt.Errorf("listing issues for assignee %s: %w", botUser, err)
 		}
 		klog.Infof("Fetched %d issues assigned to %s from GitHub API", len(assigned), botUser)
 		allItems = append(allItems, assigned...)
@@ -80,11 +86,14 @@ func (s *Scanner) scanAssigned(ctx context.Context) ([]*githubv39.Issue, error) 
 			ListOptions: githubv39.ListOptions{PerPage: s.cfg.ScanLimit},
 		})
 		if err != nil {
-			klog.Errorf("Failed to list issues created by %s: %v", s.cfg.GitHubLogin, err)
-		} else {
-			klog.Infof("Fetched %d issues created by %s from GitHub API", len(created), s.cfg.GitHubLogin)
-			allItems = append(allItems, s.adoptCreatedIssues(ctx, created)...)
+			return nil, fmt.Errorf("listing issues created by %s: %w", s.cfg.GitHubLogin, err)
 		}
+		klog.Infof("Fetched %d issues created by %s from GitHub API", len(created), s.cfg.GitHubLogin)
+		adopted, err := s.adoptCreatedIssues(ctx, created)
+		if err != nil {
+			return nil, err
+		}
+		allItems = append(allItems, adopted...)
 	}
 
 	unique := make(map[int]*githubv39.Issue)
@@ -108,10 +117,14 @@ func (s *Scanner) scanAssigned(ctx context.Context) ([]*githubv39.Issue, error) 
 // an issue they created is worked on without them having to label it, and
 // returns the ones eligible for queueing.
 //
-// The local copy is updated to match what was written, so the caller's
-// subsequent label and assignee checks see the adoption that just happened
-// rather than the state GitHub returned before it.
-func (s *Scanner) adoptCreatedIssues(ctx context.Context, created []*githubv39.Issue) []*githubv39.Issue {
+// An issue whose adoption write fails is logged and left out of the returned
+// set. Returning it anyway would leave the local copy and GitHub disagreeing
+// about whether the issue was adopted, and the caller trusts the local copy;
+// leaving it out costs nothing but a cycle, since the next pass lists it again.
+//
+// A rate limit refusal ends the pass, because every issue still to come would
+// spend its writes on refusals and arrive at the same answer.
+func (s *Scanner) adoptCreatedIssues(ctx context.Context, created []*githubv39.Issue) ([]*githubv39.Issue, error) {
 	var adopted []*githubv39.Issue
 	for _, issue := range created {
 		if issue.PullRequestLinks != nil {
@@ -123,33 +136,53 @@ func (s *Scanner) adoptCreatedIssues(ctx context.Context, created []*githubv39.I
 			continue
 		}
 
-		hasTriggerLabel := conventions.HasTriggerLabel(issue.Labels, s.cfg.TriggerLabel)
-		hasAssignee := s.assignedToPool(issue)
-
-		if !hasTriggerLabel || !hasAssignee {
-			if s.cfg.DryRun {
-				fmt.Printf("[DRYRUN] Would label issue #%d created by %s with '%s' and assign to %s\n", num, s.cfg.GitHubLogin, s.cfg.TriggerLabel, s.cfg.TargetAssignee)
-			} else {
-				fmt.Printf("Labelling issue #%d created by %s with '%s' and assigning to %s...\n", num, s.cfg.GitHubLogin, s.cfg.TriggerLabel, s.cfg.TargetAssignee)
-				if !hasTriggerLabel {
-					if err := s.gh.AddLabels(ctx, num, []string{s.cfg.TriggerLabel}); err != nil {
-						klog.Errorf("Failed to add label '%s' to issue #%d: %v", s.cfg.TriggerLabel, num, err)
-					} else {
-						issue.Labels = append(issue.Labels, &githubv39.Label{Name: githubv39.String(s.cfg.TriggerLabel)})
-					}
-				}
-				if !hasAssignee && s.cfg.TargetAssignee != "" {
-					if err := s.gh.AddAssignees(ctx, num, []string{s.cfg.TargetAssignee}); err != nil {
-						klog.Errorf("Failed to assign %s to issue #%d: %v", s.cfg.TargetAssignee, num, err)
-					} else {
-						issue.Assignees = append(issue.Assignees, &githubv39.User{Login: githubv39.String(s.cfg.TargetAssignee)})
-					}
-				}
+		if err := s.adopt(ctx, issue); err != nil {
+			if github.IsRateLimited(err) {
+				return nil, err
 			}
+			klog.Errorf("Failed to adopt issue #%d: %v", num, err)
+			continue
 		}
 		adopted = append(adopted, issue)
 	}
-	return adopted
+	return adopted, nil
+}
+
+// adopt applies the trigger label and the pool assignee to one issue the
+// operator filed, and mirrors both onto the local copy so the caller's
+// subsequent label and assignee checks see the adoption that just happened
+// rather than the state GitHub returned before it.
+//
+// The local copy is only updated once the corresponding write has landed, so a
+// partial adoption - the label written, the assignee refused - leaves the copy
+// describing exactly what GitHub now holds.
+func (s *Scanner) adopt(ctx context.Context, issue *githubv39.Issue) error {
+	num := issue.GetNumber()
+	hasTriggerLabel := conventions.HasTriggerLabel(issue.Labels, s.cfg.TriggerLabel)
+	hasAssignee := s.assignedToPool(issue)
+
+	if hasTriggerLabel && hasAssignee {
+		return nil
+	}
+	if s.cfg.DryRun {
+		fmt.Printf("[DRYRUN] Would label issue #%d created by %s with '%s' and assign to %s\n", num, s.cfg.GitHubLogin, s.cfg.TriggerLabel, s.cfg.TargetAssignee)
+		return nil
+	}
+
+	fmt.Printf("Labelling issue #%d created by %s with '%s' and assigning to %s...\n", num, s.cfg.GitHubLogin, s.cfg.TriggerLabel, s.cfg.TargetAssignee)
+	if !hasTriggerLabel {
+		if err := s.gh.AddLabels(ctx, num, []string{s.cfg.TriggerLabel}); err != nil {
+			return fmt.Errorf("adding label %q to issue #%d: %w", s.cfg.TriggerLabel, num, err)
+		}
+		issue.Labels = append(issue.Labels, &githubv39.Label{Name: githubv39.String(s.cfg.TriggerLabel)})
+	}
+	if !hasAssignee && s.cfg.TargetAssignee != "" {
+		if err := s.gh.AddAssignees(ctx, num, []string{s.cfg.TargetAssignee}); err != nil {
+			return fmt.Errorf("assigning %s to issue #%d: %w", s.cfg.TargetAssignee, num, err)
+		}
+		issue.Assignees = append(issue.Assignees, &githubv39.User{Login: githubv39.String(s.cfg.TargetAssignee)})
+	}
+	return nil
 }
 
 // assignedToPool reports whether any bot account is already assigned to the issue.

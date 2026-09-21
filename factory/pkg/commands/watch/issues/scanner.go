@@ -26,6 +26,7 @@ import (
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/common"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/api"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/conventions"
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/ratelimit"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/github"
 )
 
@@ -41,6 +42,12 @@ const (
 	DefaultSweepInterval = 5 * time.Minute
 	// defaultScanLimit bounds the fast queries when no limit is configured.
 	defaultScanLimit = 30
+	// DefaultRateLimitBackoff is how long the scanner holds off after GitHub
+	// refuses a cycle for rate limiting. Each consecutive refused cycle doubles
+	// it, up to DefaultMaxRateLimitBackoff.
+	DefaultRateLimitBackoff = ratelimit.DefaultBase
+	// DefaultMaxRateLimitBackoff caps that doubling.
+	DefaultMaxRateLimitBackoff = ratelimit.DefaultMax
 )
 
 // Queue is the subset of the task queue the Scanner needs: it adds issue tasks,
@@ -120,6 +127,12 @@ type Config struct {
 	// the entity cache itself, which it must do when no pull request scanner is
 	// running to do it. See primeOpenPRs.
 	PrimeOpenPRs bool
+	// RateLimitBackoff is the first delay applied after GitHub refuses a cycle
+	// for rate limiting. Defaults to DefaultRateLimitBackoff.
+	RateLimitBackoff time.Duration
+	// MaxRateLimitBackoff caps the growth of that delay. Defaults to
+	// DefaultMaxRateLimitBackoff.
+	MaxRateLimitBackoff time.Duration
 	// DryRun reports what would be queued without touching the queue or GitHub.
 	DryRun bool
 }
@@ -168,6 +181,11 @@ type Scanner struct {
 	processed map[int]time.Time
 	// lastSweep is when the trigger-labelled sweep last completed successfully.
 	lastSweep time.Time
+	// rateLimit holds the scanner off while GitHub is refusing it. Every GitHub
+	// error a cycle sees is reported to it, and it is consulted between issues
+	// as well as at the top of a cycle, so a refusal partway through costs the
+	// rest of the cycle rather than a doomed request per issue.
+	rateLimit *ratelimit.Backoff
 }
 
 // New constructs a Scanner from its configuration and dependencies.
@@ -189,6 +207,7 @@ func New(cfg Config, deps Deps) *Scanner {
 		sandboxes: deps.Sandboxes,
 		users:     deps.Users,
 		paused:    deps.Paused,
+		rateLimit: ratelimit.New("issue scanner", cfg.RateLimitBackoff, cfg.MaxRateLimitBackoff),
 	}
 }
 
@@ -196,33 +215,81 @@ func New(cfg Config, deps Deps) *Scanner {
 //
 // A cycle runs immediately so that a restart picks up the issues filed while
 // the daemon was down, instead of waiting out a full interval.
+//
+// The delay between cycles is decided after each one rather than fixed by a
+// ticker, because a rate limited scanner has to wait out the refusal and a
+// ticker would keep waking it on the interval to rediscover that. A timer per
+// iteration also means a cycle that overran cannot be immediately followed by a
+// queued tick.
 func (s *Scanner) Run(ctx context.Context) error {
-	ticker := time.NewTicker(s.cfg.Interval)
-	defer ticker.Stop()
-
-	s.ScanOnce(ctx)
+	s.cycle(ctx)
 
 	for {
+		timer := time.NewTimer(s.nextDelay())
 		select {
 		case <-ctx.Done():
 			// Cancellation is how this subcontroller is asked to stop, so it is
 			// not an error worth propagating to the caller.
+			timer.Stop()
 			return nil
-		case <-ticker.C:
-			s.ScanOnce(ctx)
+		case <-timer.C:
+			s.cycle(ctx)
 		}
 	}
 }
 
+// cycle runs one scan and reports its outcome to the backoff.
+//
+// This is the only place the backoff is told anything, and it is the reason
+// every GitHub call beneath it returns its error rather than logging it and
+// carrying on. A refusal surfaces here having already ended the cycle, so one
+// report is both necessary and sufficient to decide how long to wait.
+//
+// A failed cycle is not fatal to the daemon. The next one re-lists from scratch
+// and covers whatever this one did not reach.
+func (s *Scanner) cycle(ctx context.Context) {
+	err := s.ScanOnce(ctx)
+	s.rateLimit.Observe(err)
+	if err != nil {
+		klog.Errorf("Issue scan cycle failed: %v", err)
+	}
+}
+
+// nextDelay is how long to wait before the next cycle: the scan interval
+// normally, and the remainder of a rate limit wait when GitHub has refused us
+// for longer than that.
+//
+// Running the cycle anyway would cost requests that deepen the refusal and
+// return listings that cannot be told apart from a repository with nothing to
+// do, so the cadence gives way to the wait rather than racing it.
+func (s *Scanner) nextDelay() time.Duration {
+	wait, blocked := s.rateLimit.Blocked()
+	if !blocked || wait <= s.cfg.Interval {
+		return s.cfg.Interval
+	}
+	klog.V(2).Infof("Holding the next issue scan for %s: GitHub is rate limiting us.", wait.Round(time.Second))
+	return wait
+}
+
 // ScanOnce runs one scan cycle, queueing work for the issues that need it. The
 // trigger-labelled sweep runs inside it whenever it has come due.
-func (s *Scanner) ScanOnce(ctx context.Context) {
+//
+// The error returned is the first GitHub failure the cycle met, and meeting one
+// is what ended the cycle. Callers that scan on a schedule hand it to the
+// backoff; the one-shot caller reports it and exits non-zero.
+//
+// A rate limit is not consulted here: this runs a cycle when asked, and it is
+// Run that decides when to ask. An operator invoking a one-shot scan wants the
+// scan, not a report that the daemon would have waited.
+func (s *Scanner) ScanOnce(ctx context.Context) error {
 	if s.paused != nil && s.paused() {
 		klog.V(2).Infof("Skipping issue scan because the watcher is draining.")
-		return
+		return nil
 	}
 
-	s.primeOpenPRs(ctx)
+	if err := s.primeOpenPRs(ctx); err != nil {
+		return err
+	}
 	if !s.entities.HasOpenPRs() {
 		// The open PR cache is the primary duplicate-suppression signal for
 		// issue scans. An empty cache is indistinguishable from "no open PR
@@ -232,7 +299,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) {
 		// attempt to list open PRs fails. Fail closed and wait for a successful
 		// scan instead.
 		klog.Warningf("Skipping issue scan: the open PR cache is not populated, so issues with an open fix PR cannot be identified.")
-		return
+		return nil
 	}
 	refIssues := s.entities.GetReferencedIssuesMap()
 
@@ -240,26 +307,30 @@ func (s *Scanner) ScanOnce(ctx context.Context) {
 		klog.Infof("Running trigger-labelled issue sweep...")
 		labelled, err := s.scanLabelled(ctx)
 		if err != nil {
-			klog.Errorf("Failed to list issues for label %s: %v", s.cfg.TriggerLabel, err)
+			return err
 		}
-		s.queueTasks(ctx, labelled, refIssues)
+		if err := s.queueTasks(ctx, labelled, refIssues); err != nil {
+			return err
+		}
 
-		// Publish the issues this sweep observed so the sandbox reconciler can
-		// garbage collect the closed ones without re-querying GitHub. A failed
-		// sweep returns whatever it managed to page in, which would publish a
-		// truncated set as though it were the whole picture.
-		if err == nil {
-			s.lastSweep = time.Now()
-			s.publishOpenIssues(labelled)
-		}
+		// The sweep is only recorded as done once it has been queued from, so a
+		// cycle that ended partway through sweeps again rather than waiting out
+		// the sweep interval over an issue set it never finished with.
+		//
+		// Publishing the issues this sweep observed lets the sandbox reconciler
+		// garbage collect the closed ones without re-querying GitHub, and it
+		// happens here for the same reason: a set published by a cycle that did
+		// not complete is one the reconciler would act on.
+		s.lastSweep = time.Now()
+		s.publishOpenIssues(labelled)
 	}
 
 	klog.Infof("Running fast issue scan cycle...")
 	assigned, err := s.scanAssigned(ctx)
 	if err != nil {
-		klog.Errorf("Failed to scan assigned issues: %v", err)
+		return err
 	}
-	s.queueTasks(ctx, assigned, refIssues)
+	return s.queueTasks(ctx, assigned, refIssues)
 }
 
 // sweepDue reports whether the trigger-labelled sweep has come due. It runs on
@@ -282,17 +353,17 @@ func (s *Scanner) sweepDue() bool {
 // to it yet". Priming whenever the cache happened to be cold would have both
 // scanners issue the same paginated listing on every start, and would leave the
 // cache with two writers.
-func (s *Scanner) primeOpenPRs(ctx context.Context) {
+func (s *Scanner) primeOpenPRs(ctx context.Context) error {
 	if !s.cfg.PrimeOpenPRs || s.entities.HasOpenPRs() || !s.gh.Ready() {
-		return
+		return nil
 	}
 	klog.Infof("Populating open PRs cache for referenced issues...")
 	prs, err := s.gh.ListOpenPRs(ctx)
 	if err != nil {
-		klog.Errorf("Failed to populate open PRs cache: %v", err)
-		return
+		return fmt.Errorf("populating open PRs cache: %w", err)
 	}
 	s.entities.UpdateOpenPRs(prs)
+	return nil
 }
 
 // publishOpenIssues records which issues are known to be open in the shared
@@ -318,27 +389,41 @@ func (s *Scanner) publishOpenIssues(openIssues []*githubv39.Issue) {
 
 // queueTasks queues a fix - or the workflow the issue asks for - for every
 // issue that still needs one.
-func (s *Scanner) queueTasks(ctx context.Context, issues []*githubv39.Issue, refIssues map[int]bool) {
+//
+// An issue that fails for its own reasons - a malformed workflow reference, an
+// issue closed between the listing and the read - is logged and skipped, so one
+// bad issue cannot hold up the rest of the queue indefinitely.
+//
+// A rate limit refusal does end the pass. Each issue costs a timeline listing
+// and often a search, so the ones still to come would spend that on refusals
+// and arrive at the same answer; they are picked up by the cycle after the wait.
+func (s *Scanner) queueTasks(ctx context.Context, issues []*githubv39.Issue, refIssues map[int]bool) error {
 	klog.Infof("queueTasks called with %d issues", len(issues))
 	for _, issue := range issues {
-		s.queueTask(ctx, issue, refIssues)
+		if err := s.queueTask(ctx, issue, refIssues); err != nil {
+			if github.IsRateLimited(err) {
+				return err
+			}
+			klog.Errorf("Failed to queue task for issue #%d: %v", issue.GetNumber(), err)
+		}
 	}
+	return nil
 }
 
 // queueTask evaluates one issue and queues its task if it needs one.
-func (s *Scanner) queueTask(ctx context.Context, issue *githubv39.Issue, refIssues map[int]bool) {
+func (s *Scanner) queueTask(ctx context.Context, issue *githubv39.Issue, refIssues map[int]bool) error {
 	num := issue.GetNumber()
 	if s.cfg.MinNumber > 0 && num < s.cfg.MinNumber {
-		return
+		return nil
 	}
 	if conventions.HasStopLabel(issue.Labels, s.cfg.TriggerLabel) {
 		klog.Infof("Skipping issue #%d because it has the stop label ('overseer/stop' or '%s/stop')", num, s.cfg.TriggerLabel)
 		_ = s.queue.RemovePendingTasksForNumber(num)
-		return
+		return nil
 	}
 	if refIssues[num] {
 		klog.Infof("Skipping issue #%d because there is already a PR referencing it.", num)
-		return
+		return nil
 	}
 
 	// An issue may name a workflow in its description, in which case the task
@@ -363,17 +448,17 @@ func (s *Scanner) queueTask(ctx context.Context, issue *githubv39.Issue, refIssu
 	}
 
 	if s.queue.TaskExists(filename) {
-		return
+		return nil
 	}
 
 	if s.inCooldown(ctx, filename, workflowPath) {
-		return
+		return nil
 	}
 
 	processed := s.processedIssues()
 	lastProcessed, ok := processed[num]
 	if ok && !issue.GetUpdatedAt().After(lastProcessed) && workflowName == "" {
-		return
+		return nil
 	}
 
 	var timeline []*githubv39.Timeline
@@ -381,11 +466,10 @@ func (s *Scanner) queueTask(ctx context.Context, issue *githubv39.Issue, refIssu
 	if s.gh.Ready() {
 		tl, complete, err := s.gh.ListIssueTimeline(ctx, num)
 		if err != nil {
-			klog.Warningf("Failed to list timeline for issue #%d: %v", num, err)
-		} else {
-			timeline = tl
-			timelineComplete = complete
+			return fmt.Errorf("listing timeline for issue #%d: %w", num, err)
 		}
+		timeline = tl
+		timelineComplete = complete
 	}
 
 	// Skip the linked-PR check for workflow triggers, which do not necessarily
@@ -401,11 +485,11 @@ func (s *Scanner) queueTask(ctx context.Context, issue *githubv39.Issue, refIssu
 		}
 		linked, err := s.gh.HasLinkedPRWithTimeline(ctx, num, verifiedTimeline)
 		if err != nil {
-			klog.Errorf("Failed to check linked PR for issue #%d: %v", num, err)
-			return
-		} else if linked {
+			return fmt.Errorf("checking linked PR for issue #%d: %w", num, err)
+		}
+		if linked {
 			klog.Infof("Skipping issue #%d because it has a linked PR according to the Timeline API.", num)
-			return
+			return nil
 		}
 	}
 
@@ -414,19 +498,23 @@ func (s *Scanner) queueTask(ctx context.Context, issue *githubv39.Issue, refIssu
 		sandboxName = fmt.Sprintf("wf-issue-%d", num)
 	}
 
+	// A sandbox lookup talks to the cluster rather than to GitHub, so a failure
+	// says nothing about the quota and is this issue's problem alone.
 	running, err := s.sandboxes.IsTaskRunning(ctx, sandboxName)
 	if err != nil {
 		klog.Errorf("Failed to check if sandbox %s is running: %v", sandboxName, err)
-		return
+		return nil
 	} else if running {
 		klog.Infof("Skipping issue #%d because there is an in-flight sandbox %s.", num, sandboxName)
-		return
+		return nil
 	}
 
 	wasAutoLabeled := false
 	if !conventions.HasTriggerLabel(issue.Labels, s.cfg.TriggerLabel) {
 		wasAutoLabeled = true
-		s.applyTriggerLabel(ctx, num)
+		if err := s.applyTriggerLabel(ctx, num); err != nil {
+			return err
+		}
 	}
 
 	triggerEventTime, triggerReason, triggerNotes := triggerInfo(issue, timeline, s.cfg.TriggerLabel, wasAutoLabeled)
@@ -469,7 +557,7 @@ func (s *Scanner) queueTask(ctx context.Context, issue *githubv39.Issue, refIssu
 		} else {
 			fmt.Printf("[DRYRUN] Would queue fix task for issue #%d: %s\n", num, task.URL)
 		}
-		return
+		return nil
 	}
 
 	if workflowName != "" {
@@ -477,10 +565,14 @@ func (s *Scanner) queueTask(ctx context.Context, issue *githubv39.Issue, refIssu
 	} else {
 		fmt.Printf("Queueing fix task for issue #%d...\n", num)
 	}
+	// The issue is stamped as processed before the enqueue rather than after,
+	// so that a failure to write the task file does not leave the next cycle
+	// queueing the same work again.
 	processed[num] = time.Now()
 	if err := s.queue.Enqueue(filename, task); err != nil {
 		klog.Errorf("Failed to queue task for issue #%d: %v", num, err)
 	}
+	return nil
 }
 
 // inCooldown reports whether the same task completed recently enough that it
@@ -502,15 +594,20 @@ func (s *Scanner) inCooldown(ctx context.Context, filename, workflowPath string)
 
 // applyTriggerLabel adopts an issue that was picked up by assignment rather
 // than by label, so that the label always records what the watcher is acting on.
-func (s *Scanner) applyTriggerLabel(ctx context.Context, num int) {
+//
+// A failed write is returned rather than logged, because the caller goes on to
+// describe the task as auto-labelled: queueing it anyway would record a trigger
+// reason that nothing on the issue supports.
+func (s *Scanner) applyTriggerLabel(ctx context.Context, num int) error {
 	if s.cfg.DryRun {
 		fmt.Printf("[DRYRUN] Would add label '%s' to issue #%d\n", s.cfg.TriggerLabel, num)
-		return
+		return nil
 	}
 	klog.Infof("Adding '%s' label to issue #%d", s.cfg.TriggerLabel, num)
 	if err := s.gh.AddLabels(ctx, num, []string{s.cfg.TriggerLabel}); err != nil {
-		klog.Errorf("Failed to add label '%s' to issue #%d: %v", s.cfg.TriggerLabel, num, err)
+		return fmt.Errorf("adding label %q to issue #%d: %w", s.cfg.TriggerLabel, num, err)
 	}
+	return nil
 }
 
 // selectUser resolves the bot account the task runs as, falling back to the

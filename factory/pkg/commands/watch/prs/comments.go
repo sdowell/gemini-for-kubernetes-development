@@ -50,7 +50,7 @@ func (s *Scanner) evaluateComments(
 	history *prHistory,
 	lastCommitTime, lastCommentAddressedTime time.Time,
 	lastCommentAddressedSHA, headSHA string,
-) prCommentAnalysis {
+) (prCommentAnalysis, error) {
 	var analysis prCommentAnalysis
 
 	comments := history.comments
@@ -97,7 +97,11 @@ func (s *Scanner) evaluateComments(
 			continue
 		}
 		if c.GetCreatedAt().After(lastCommitTime) && c.GetCreatedAt().After(lastCommentAddressedTime) && c.GetCreatedAt().After(latestBotReplyTime) {
-			if !s.reactions.CommentState(ctx, c.GetID()).NeedsAttention() {
+			state, err := s.reactions.CommentState(ctx, c.GetID())
+			if err != nil {
+				return prCommentAnalysis{}, err
+			}
+			if !state.NeedsAttention() {
 				continue
 			}
 			if isReviewer {
@@ -187,7 +191,7 @@ func (s *Scanner) evaluateComments(
 		}
 	}
 
-	return analysis
+	return analysis, nil
 }
 
 // hasBotReviewAfterLastCommit reports whether the current head has already been

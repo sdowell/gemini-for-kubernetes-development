@@ -2,6 +2,7 @@ package conventions
 
 import (
 	"context"
+	"fmt"
 
 	githubv39 "github.com/google/go-github/v39/github"
 )
@@ -109,18 +110,23 @@ func NewReactionInterpreter(lister ReactionLister, selfLogin string, bots []stri
 // scanner asks four questions of each comment and a busy pull request has
 // dozens of them.
 //
-// A failed fetch reads as an unmarked comment. That errs towards the watcher
-// doing the work again rather than silently dropping feedback, and a repeated
-// task is recoverable in a way that ignored review comments are not.
-func (i *ReactionInterpreter) CommentState(ctx context.Context, commentID int64) CommentState {
+// A failed fetch is reported rather than read as an unmarked comment. The
+// difference only matters when GitHub is refusing us, and that is exactly when
+// it matters most: every comment would come back unmarked at once, and the
+// caller would re-acknowledge and re-queue a whole pull request's worth of
+// feedback that had already been answered.
+//
+// An interpreter with no client is not a failure - it is how a caller says
+// there are no reactions to read - so it still answers with the zero state.
+func (i *ReactionInterpreter) CommentState(ctx context.Context, commentID int64) (CommentState, error) {
 	if i == nil || i.lister == nil {
-		return CommentState{}
+		return CommentState{}, nil
 	}
 	reactions, err := i.lister.IssueCommentReactions(ctx, commentID)
 	if err != nil {
-		return CommentState{}
+		return CommentState{}, fmt.Errorf("listing reactions on comment %d: %w", commentID, err)
 	}
-	return i.Interpret(reactions)
+	return i.Interpret(reactions), nil
 }
 
 // Interpret reads an already-fetched set of reactions. It is the whole of the

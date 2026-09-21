@@ -50,31 +50,37 @@ type prContext struct {
 // It is gated on the head SHA rather than on time: if the last rebase produced
 // no new commit then it did not resolve anything, and running it again against
 // the identical tree would produce the identical result.
-func (s *Scanner) handlePRIterate(ctx context.Context, pc *prContext) {
+//
+// Only GitHub failures are returned. A sandbox lookup or a task file that could
+// not be written is this pull request's problem alone, and the cycle should
+// carry on to the others rather than treating it as a repository-wide fault.
+func (s *Scanner) handlePRIterate(ctx context.Context, pc *prContext) error {
 	num := pc.prIssue.GetNumber()
 	state := s.state.get(num)
 
 	// A conflicted pull request is never ready for a human, whatever it looked
 	// like before.
-	s.reconcileReadyForHumanLabel(ctx, num, pc.prIssue, false, pc.headSHA)
+	if err := s.reconcileReadyForHumanLabel(ctx, num, pc.prIssue, false, pc.headSHA); err != nil {
+		return err
+	}
 	if state.lastIteratedSHA != "" && state.lastIteratedSHA == pc.headSHA {
 		klog.Infof("Skipping PR #%d rebase/conflict resolution because an iterate task was already processed for head SHA %s.", num, pc.headSHA)
-		return
+		return nil
 	}
 
 	filename := fmt.Sprintf("task-pr-%d-iterate.yaml", num)
 	if s.queue.TaskExists(filename) {
-		return
+		return nil
 	}
 
 	sandboxName := s.sandboxes.ResolveName(ctx, api.TypePRIterate, num)
 	running, err := s.sandboxes.IsTaskRunning(ctx, sandboxName)
 	if err != nil {
 		klog.Errorf("Failed to check if sandbox %s is running: %v", sandboxName, err)
-		return
+		return nil
 	} else if running {
 		klog.Infof("Skipping PR #%d rebase because there is an in-flight sandbox %s.", num, sandboxName)
-		return
+		return nil
 	}
 
 	baseRef := ""
@@ -97,7 +103,7 @@ func (s *Scanner) handlePRIterate(ctx context.Context, pc *prContext) {
 
 	if s.cfg.DryRun {
 		fmt.Printf("[DRYRUN] Would queue rebase task for PR #%d: %s\n", num, pc.prURL)
-		return
+		return nil
 	}
 	fmt.Printf("Queueing rebase task for PR #%d...\n", num)
 	// The state is recorded before the enqueue rather than after, so that a
@@ -109,6 +115,7 @@ func (s *Scanner) handlePRIterate(ctx context.Context, pc *prContext) {
 	if err := s.queue.Enqueue(filename, task); err != nil {
 		klog.Errorf("Failed to queue rebase task for PR #%d: %v", num, err)
 	}
+	return nil
 }
 
 // canInvestigatePR reports whether CI failures on this pull request are worth
@@ -154,43 +161,45 @@ func (s *Scanner) handlePRInvestigate(
 	pc *prContext,
 	checkAnalysis prCheckAnalysis,
 	comments []*githubv39.IssueComment,
-) {
+) error {
 	num := pc.prIssue.GetNumber()
 	state := s.state.get(num)
 	filename := fmt.Sprintf("task-pr-%d-investigate.yaml", num)
 
 	if s.queue.TaskExists(filename) {
-		return
+		return nil
 	}
 
 	investigationCount := getInvestigationCount(comments, pc.lastCommitTime, s.cfg.BotUsers, s.cfg.GitHubLogin, s.cfg.AllowlistedBots, s.cfg.TriggerLabel)
 	if investigationCount >= maxInvestigations {
 		stopLabel := conventions.StopLabel(s.cfg.TriggerLabel)
 		if !s.cfg.DryRun {
-			s.comment(ctx, num, fmt.Sprintf("🤖 AI Factory has attempted to investigate/fix CI check failures for this pull request %d times since the last commit or update without success. To prevent infinite loops, I am pausing automated investigation and attaching the `%s` label.\n\nTo request another attempt or resume automated processing, please remove the `%s` label from this pull request (and/or push a new commit or leave a comment).", maxInvestigations, stopLabel, stopLabel))
+			if err := s.comment(ctx, num, fmt.Sprintf("🤖 AI Factory has attempted to investigate/fix CI check failures for this pull request %d times since the last commit or update without success. To prevent infinite loops, I am pausing automated investigation and attaching the `%s` label.\n\nTo request another attempt or resume automated processing, please remove the `%s` label from this pull request (and/or push a new commit or leave a comment).", maxInvestigations, stopLabel, stopLabel)); err != nil {
+				return err
+			}
 			if err := s.gh.AddLabels(ctx, num, []string{stopLabel}); err != nil {
-				klog.Errorf("Failed to add stop label '%s' to PR #%d: %v", stopLabel, num, err)
+				return fmt.Errorf("adding stop label %q to PR #%d: %w", stopLabel, num, err)
 			}
 		}
 		klog.Infof("Skipping PR #%d investigate because it has reached the maximum retry limit (%d attempts since last update) and applying stop label '%s'.", num, maxInvestigations, stopLabel)
-		return
+		return nil
 	}
 
 	if state.lastInvestigatedSHA == pc.headSHA &&
 		!s.lastInvestigationFailed(filename) &&
 		!pc.isExplicitlyAssigned &&
 		time.Since(state.lastInvestigatedTime) <= investigationRetryAfter {
-		return
+		return nil
 	}
 
 	sandboxName := s.sandboxes.ResolveName(ctx, api.TypePRInvestigate, num)
 	running, err := s.sandboxes.IsTaskRunning(ctx, sandboxName)
 	if err != nil {
 		klog.Errorf("Failed to check if sandbox %s is running: %v", sandboxName, err)
-		return
+		return nil
 	} else if running {
 		klog.Infof("Skipping PR #%d investigate because there is an in-flight sandbox %s.", num, sandboxName)
-		return
+		return nil
 	}
 
 	eventTime := checkAnalysis.earliestFailureTime
@@ -221,7 +230,7 @@ func (s *Scanner) handlePRInvestigate(
 
 	if s.cfg.DryRun {
 		fmt.Printf("[DRYRUN] Would queue investigate task for PR #%d: %s\n", num, pc.prURL)
-		return
+		return nil
 	}
 	fmt.Printf("Queueing investigate task for PR #%d...\n", num)
 	state.lastInvestigatedSHA = pc.headSHA
@@ -230,29 +239,35 @@ func (s *Scanner) handlePRInvestigate(
 	if err := s.queue.Enqueue(filename, task); err != nil {
 		klog.Errorf("Failed to queue investigate task for PR #%d: %v", num, err)
 	}
+	return nil
 }
 
 // handlePRComments queues a task to address the outstanding review feedback.
-func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAnalysis prCommentAnalysis) {
+//
+// The reactions go on before the state is recorded, so returning early on a
+// failed reaction leaves nothing behind: the comments stay unacknowledged and
+// the next cycle finds the same outstanding feedback. Recording the state first
+// would lose the comments to a reaction that never landed.
+func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAnalysis prCommentAnalysis) error {
 	if os.Getenv("DRY_RUN") == "true" {
-		return
+		return nil
 	}
 	num := pc.prIssue.GetNumber()
 	state := s.state.get(num)
 	filename := fmt.Sprintf("task-pr-%d-comments.yaml", num)
 
 	if s.queue.TaskExists(filename) {
-		return
+		return nil
 	}
 
 	sandboxName := s.sandboxes.ResolveName(ctx, api.TypePRComments, num)
 	running, err := s.sandboxes.IsTaskRunning(ctx, sandboxName)
 	if err != nil {
 		klog.Errorf("Failed to check if sandbox %s is running: %v", sandboxName, err)
-		return
+		return nil
 	} else if running {
 		klog.Infof("Skipping PR #%d address-comments because there is an in-flight sandbox %s.", num, sandboxName)
-		return
+		return nil
 	}
 
 	commitInfo := ""
@@ -283,16 +298,20 @@ func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAn
 
 	if s.cfg.DryRun {
 		fmt.Printf("[DRYRUN] Would queue address-comments task for PR #%d: %s\n", num, pc.prURL)
-		return
+		return nil
 	}
 	fmt.Printf("Queueing address-comments task for PR #%d...\n", num)
 	// The acknowledgement reactions are what tell the next cycle these comments
 	// are already spoken for, and what tell the commenter they were seen.
 	for _, cid := range commentAnalysis.unackCommentIDs {
-		s.react(ctx, cid, conventions.ReactionAcknowledged)
+		if err := s.react(ctx, cid, conventions.ReactionAcknowledged); err != nil {
+			return err
+		}
 	}
 	for _, cid := range commentAnalysis.unackPRCommentIDs {
-		s.reactToReviewComment(ctx, cid, conventions.ReactionAcknowledged)
+		if err := s.reactToReviewComment(ctx, cid, conventions.ReactionAcknowledged); err != nil {
+			return err
+		}
 	}
 	state.lastCommentAddressedTime = time.Now()
 	state.lastCommentAddressedSHA = pc.headSHA
@@ -300,33 +319,36 @@ func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAn
 	if err := s.queue.Enqueue(filename, task); err != nil {
 		klog.Errorf("Failed to queue address-comments task for PR #%d: %v", num, err)
 	}
+	return nil
 }
 
 // handlePRReview queues an automated review of a green, unreviewed pull request.
 //
 // Review instructions are collected from the pull request body and from the
 // issues it closes, so that a repository can steer the review from wherever the
-// requirement was written down.
-func (s *Scanner) handlePRReview(ctx context.Context, pc *prContext, checkRuns []*githubv39.CheckRun) {
+// requirement was written down. An issue that cannot be read is an error rather
+// than an omission: reviewing against a truncated instruction set produces a
+// review that looks complete and is not.
+func (s *Scanner) handlePRReview(ctx context.Context, pc *prContext, checkRuns []*githubv39.CheckRun) error {
 	if os.Getenv("DRY_RUN") == "true" {
-		return
+		return nil
 	}
 	num := pc.prIssue.GetNumber()
 	state := s.state.get(num)
 	filename := fmt.Sprintf("task-pr-%d-review.yaml", num)
 
 	if s.queue.TaskExists(filename) {
-		return
+		return nil
 	}
 
 	sandboxName := s.sandboxes.ResolveName(ctx, api.TypePRReview, num)
 	running, err := s.sandboxes.IsTaskRunning(ctx, sandboxName)
 	if err != nil {
 		klog.Errorf("Failed to check if sandbox %s is running: %v", sandboxName, err)
-		return
+		return nil
 	} else if running {
 		klog.Infof("Skipping PR #%d review because there is an in-flight sandbox %s.", num, sandboxName)
-		return
+		return nil
 	}
 
 	var bodies []string
@@ -335,7 +357,10 @@ func (s *Scanner) handlePRReview(ctx context.Context, pc *prContext, checkRuns [
 	}
 	for refIssueNum := range common.GetReferencedIssues(pc.pr) {
 		refIssue, err := s.gh.GetIssue(ctx, refIssueNum)
-		if err == nil && refIssue.GetBody() != "" {
+		if err != nil {
+			return fmt.Errorf("fetching referenced issue #%d for PR #%d review instructions: %w", refIssueNum, num, err)
+		}
+		if refIssue.GetBody() != "" {
 			bodies = append(bodies, refIssue.GetBody())
 		}
 	}
@@ -373,7 +398,7 @@ func (s *Scanner) handlePRReview(ctx context.Context, pc *prContext, checkRuns [
 
 	if s.cfg.DryRun {
 		fmt.Printf("[DRYRUN] Would queue review task for PR #%d: %s\n", num, pc.prURL)
-		return
+		return nil
 	}
 	fmt.Printf("Queueing review task for PR #%d (Instructions: %d)...\n", num, len(instructions))
 	state.lastReviewedSHA = pc.headSHA
@@ -381,4 +406,5 @@ func (s *Scanner) handlePRReview(ctx context.Context, pc *prContext, checkRuns [
 	if err := s.queue.Enqueue(filename, task); err != nil {
 		klog.Errorf("Failed to queue review task for PR #%d: %v", num, err)
 	}
+	return nil
 }

@@ -34,20 +34,22 @@ type prHistory struct {
 
 // fetchHistory reads the commits, comments and reviews of a pull request.
 //
-// A failure to list commits is tolerated - a zero lastCommitTime simply makes
-// every comment look new, which errs towards doing the work again rather than
-// towards silently skipping it. A failure to list comments or reviews is not:
-// without them the scanner cannot tell whether feedback is outstanding, and
-// acting on that blank picture would queue the wrong task.
+// Every listing is required. It is tempting to tolerate the ones that only feed
+// a timestamp, but a missing commit list produces a zero lastCommitTime, which
+// makes every comment on the pull request look new, and a missing inline
+// comment list makes a review full of requested changes look empty. Both read
+// as an ordinary pull request rather than as a failure, so the cycle would act
+// confidently on a picture it does not have.
 func (s *Scanner) fetchHistory(ctx context.Context, num int) (*prHistory, error) {
 	h := &prHistory{revCommentsMap: make(map[int64][]*githubv39.PullRequestComment)}
 
 	commits, err := s.gh.ListCommits(ctx, num)
-	if err == nil {
-		for _, c := range commits {
-			if c.GetCommit().GetCommitter().GetDate().After(h.lastCommitTime) {
-				h.lastCommitTime = c.GetCommit().GetCommitter().GetDate()
-			}
+	if err != nil {
+		return nil, fmt.Errorf("listing commits: %w", err)
+	}
+	for _, c := range commits {
+		if c.GetCommit().GetCommitter().GetDate().After(h.lastCommitTime) {
+			h.lastCommitTime = c.GetCommit().GetCommitter().GetDate()
 		}
 	}
 
@@ -62,9 +64,11 @@ func (s *Scanner) fetchHistory(ctx context.Context, num int) (*prHistory, error)
 	}
 
 	for _, r := range h.reviews {
-		if rc, err := s.gh.ListReviewComments(ctx, num, r.GetID()); err == nil {
-			h.revCommentsMap[r.GetID()] = rc
+		rc, err := s.gh.ListReviewComments(ctx, num, r.GetID())
+		if err != nil {
+			return nil, fmt.Errorf("listing comments on review %d: %w", r.GetID(), err)
 		}
+		h.revCommentsMap[r.GetID()] = rc
 	}
 
 	return h, nil
@@ -78,34 +82,42 @@ func (s *Scanner) fetchHistory(ctx context.Context, num int) (*prHistory, error)
 // on a change that will never merge. The stop label is applied rather than the
 // pull request being silently dropped, so that the pause is visible and a human
 // can undo it by removing the label.
-func (s *Scanner) pauseIfInactive(ctx context.Context, pr *githubv39.PullRequest, prIssue *githubv39.Issue, history *prHistory, headSHA string) bool {
+//
+// The pause is only reported as done once the label is on. Returning true after
+// a failed write would tell the caller the pull request is paused when nothing
+// on GitHub says so, and the next cycle would find it unpaused and active.
+func (s *Scanner) pauseIfInactive(ctx context.Context, pr *githubv39.PullRequest, prIssue *githubv39.Issue, history *prHistory, headSHA string) (bool, error) {
 	if s.cfg.InactivityTimeout <= 0 {
-		return false
+		return false, nil
 	}
 	num := prIssue.GetNumber()
 	lastActivity := getLastPRActivityTime(pr, history.comments, history.reviews, history.revCommentsMap, s.cfg.GitHubLogin, s.cfg.AllowlistedBots, s.cfg.TriggerLabel)
 	if time.Since(lastActivity) <= s.cfg.InactivityTimeout {
-		return false
+		return false, nil
 	}
 
 	stopLabel := conventions.StopLabel(s.cfg.TriggerLabel)
-	s.reconcileReadyForHumanLabel(ctx, num, prIssue, false, headSHA)
+	if err := s.reconcileReadyForHumanLabel(ctx, num, prIssue, false, headSHA); err != nil {
+		return false, err
+	}
 	if s.cfg.DryRun {
 		fmt.Printf("[DRYRUN] Would pause automated processing on PR #%d and apply label '%s' due to inactivity since %v\n", num, stopLabel, lastActivity)
-		return true
+		return true, nil
 	}
 
 	klog.Infof("Pausing automated processing on PR #%d and applying label '%s' due to inactivity since %v", num, stopLabel, lastActivity)
 	// The explanatory comment is only posted once: it is itself bot activity,
 	// so re-posting it every cycle would spam a thread nobody is reading.
 	if !hasInactivityComment(history.comments, lastActivity) {
-		s.comment(ctx, num, fmt.Sprintf("🤖 AI Factory has paused automated processing on this pull request due to a period of inactivity with no human comments (inactive for %s). I have applied the `%s` label.\n\nTo resume automated processing, please remove the `%s` label from this pull request and add a new comment/review.", s.cfg.InactivityTimeout, stopLabel, stopLabel))
+		if err := s.comment(ctx, num, fmt.Sprintf("🤖 AI Factory has paused automated processing on this pull request due to a period of inactivity with no human comments (inactive for %s). I have applied the `%s` label.\n\nTo resume automated processing, please remove the `%s` label from this pull request and add a new comment/review.", s.cfg.InactivityTimeout, stopLabel, stopLabel)); err != nil {
+			return false, err
+		}
 	}
 	if err := s.gh.AddLabels(ctx, num, []string{stopLabel}); err != nil {
-		klog.Errorf("Failed to add stop label '%s' to PR #%d: %v", stopLabel, num, err)
+		return false, fmt.Errorf("adding stop label %q to PR #%d: %w", stopLabel, num, err)
 	}
 	_ = s.queue.RemovePendingTasksForNumber(num)
-	return true
+	return true, nil
 }
 
 // getLastPRActivityTime returns when a human last engaged with the pull

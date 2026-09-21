@@ -1,8 +1,10 @@
 package prs
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	githubv39 "github.com/google/go-github/v39/github"
@@ -18,6 +20,33 @@ import (
 )
 
 func stringPtr(s string) *string { return &s }
+
+// isReviewCommentsRequest reports whether the request is for the inline
+// comments of one review.
+//
+// Any test server whose fixture returns a review needs a case for this, because
+// fetchHistory reads the inline comments of every review it lists. Falling
+// through to a default handler that answers with a JSON object is not harmless:
+// the client is decoding into an array, and that failure now aborts the whole
+// evaluation rather than leaving the review looking like it had no inline
+// comments.
+func isReviewCommentsRequest(r *http.Request) bool {
+	return r.Method == http.MethodGet &&
+		strings.Contains(r.URL.Path, "/reviews/") &&
+		strings.HasSuffix(r.URL.Path, "/comments")
+}
+
+// isReadReactionsRequest reports whether the request reads the reactions on a
+// comment, as opposed to adding one.
+//
+// Any test server whose fixture returns a comment needs a case for this, for
+// the same reason as isReviewCommentsRequest: evaluateComments asks for each
+// candidate comment's reactions to decide whether it was already acknowledged,
+// and an unstubbed read is now a failure rather than a comment that reads as
+// unmarked.
+func isReadReactionsRequest(r *http.Request) bool {
+	return r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/reactions")
+}
 
 // newTestKubeClient returns a client backed by an empty fake cluster, which
 // makes every sandbox lookup report "not running" - the state in which the

@@ -14,6 +14,7 @@ import (
 	githubv39 "github.com/google/go-github/v39/github"
 
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/api"
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/ratelimit"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/github"
 )
 
@@ -196,6 +197,14 @@ func TestQueueTasks_ReadsFinishedWorkFromQueue(t *testing.T) {
 				// An empty but complete timeline settles the linked-PR check
 				// without a fall back to the Search API.
 				_ = json.NewEncoder(w).Encode([]*githubv39.Timeline{})
+				return
+			}
+			if strings.HasSuffix(r.URL.Path, "/labels") {
+				// Adopting an unlabelled issue posts here, and the response is
+				// the issue's labels. Answering with the default object body
+				// fails to decode, which now ends the scan rather than being
+				// logged and stepped over.
+				_ = json.NewEncoder(w).Encode([]*githubv39.Label{})
 				return
 			}
 			_, _ = w.Write([]byte("{}"))
@@ -513,5 +522,221 @@ func TestRun_StopsOnContextCancellation(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run() did not return within 5s of cancellation")
+	}
+}
+
+// rateLimitedServer refuses every request the way GitHub refuses one that has
+// tripped a secondary limit, and counts what was asked for.
+//
+// No quota headers are sent, deliberately. go-github throttles itself once it
+// has seen them, which would make a cycle that spent nothing look like a
+// working backoff no matter what this package did.
+func rateLimitedServer(t *testing.T) (*github.Client, func() int) {
+	t.Helper()
+
+	var mu sync.Mutex
+	var calls int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}`))
+	}))
+	t.Cleanup(server.Close)
+
+	gh := githubv39.NewClient(nil)
+	gh.BaseURL, _ = url.Parse(server.URL + "/")
+
+	return github.ForRepo(gh, "test-owner", "test-repo"), func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls
+	}
+}
+
+// TestScanCycle_RateLimitStopsTheCycleAndDelaysTheNext covers both halves of
+// the backoff, and the seam between them.
+//
+// Within the cycle, the refusal must stop it: the quota is one number, so
+// repeating the listing for every bot account and then for the operator only
+// collects the same refusal. ScanOnce reports that by returning the error
+// rather than by consulting the backoff, and it is Run - through cycle - that
+// feeds it in. Between cycles, the resulting wait must displace the scan
+// interval, which is what stops the daemon waking half a minute later to spend
+// the same requests on the same refusal.
+func TestScanCycle_RateLimitStopsTheCycleAndDelaysTheNext(t *testing.T) {
+	gh, requests := rateLimitedServer(t)
+	s, _, _ := newScanner(t, Config{GitHubLogin: "operator", BotUsers: []string{"bot1", "bot2"}}, Deps{GitHub: gh})
+
+	if got := s.nextDelay(); got != s.cfg.Interval {
+		t.Fatalf("delay before any refusal = %v, want the scan interval %v", got, s.cfg.Interval)
+	}
+
+	err := s.ScanOnce(context.Background())
+	if err == nil {
+		t.Fatal("ScanOnce() error = nil, want the refusal that stopped the cycle")
+	}
+	if !github.IsRateLimited(err) {
+		t.Errorf("ScanOnce() error = %v, want one the backoff recognises as a rate limit", err)
+	}
+
+	refused := requests()
+	if refused == 0 {
+		t.Fatal("the cycle made no requests; the test cannot tell a backoff from a no-op")
+	}
+	if refused > 1 {
+		t.Errorf("the refused cycle made %d requests, want 1", refused)
+	}
+
+	// ScanOnce reports the refusal; it does not act on it. Nothing has told the
+	// backoff yet, so the cadence is still the plain interval.
+	if got := s.nextDelay(); got != s.cfg.Interval {
+		t.Errorf("delay after an unreported refusal = %v, want the scan interval %v: only Run feeds the backoff", got, s.cfg.Interval)
+	}
+
+	s.cycle(context.Background())
+
+	delay := s.nextDelay()
+	if delay <= s.cfg.Interval {
+		t.Errorf("delay after the refusal = %v, want longer than the scan interval %v", delay, s.cfg.Interval)
+	}
+	if delay > DefaultMaxRateLimitBackoff {
+		t.Errorf("delay after the refusal = %v, want no more than the cap %v", delay, DefaultMaxRateLimitBackoff)
+	}
+}
+
+// TestRun_WaitsOutTheRateLimitBeforeScanningAgain is the same guarantee seen
+// from outside: the loop that schedules cycles honours the wait, rather than
+// each cycle waking up and turning itself away.
+func TestRun_WaitsOutTheRateLimitBeforeScanningAgain(t *testing.T) {
+	gh, requests := rateLimitedServer(t)
+	// An interval short enough that a second cycle would have run many times
+	// over by the time the test looks, if the refusal were not holding it.
+	s, _, _ := newScanner(t, Config{Interval: time.Millisecond, BotUsers: []string{"bot1"}}, Deps{GitHub: gh})
+	s.rateLimit = ratelimit.New("test", time.Hour, time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return within 5s of cancellation")
+	}
+
+	// Only the immediate cycle Run starts with should have happened.
+	if got := requests(); got != 1 {
+		t.Errorf("made %d requests over 100 one-millisecond intervals, want 1: the hour-long wait was not honoured", got)
+	}
+}
+
+// TestRun_ResumesAfterTheBackoff checks the other half: the scanner comes back
+// on its own once the wait has elapsed, without needing a restart.
+func TestRun_ResumesAfterTheBackoff(t *testing.T) {
+	gh, requests := rateLimitedServer(t)
+	s, _, _ := newScanner(t, Config{Interval: time.Millisecond, BotUsers: []string{"bot1"}}, Deps{GitHub: gh})
+	// A wait short enough to serve out inside a test, rather than the half
+	// minute a deployment uses.
+	s.rateLimit = ratelimit.New("test", 5*time.Millisecond, 5*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return within 5s of cancellation")
+	}
+
+	if got := requests(); got < 2 {
+		t.Errorf("made %d requests, want more than one: the scanner did not resume after its wait elapsed", got)
+	}
+}
+
+// twoIssueServer serves issue #8 well enough to be queued, and lets the caller
+// decide how issue #7's timeline is answered. That read is the first GitHub call
+// queueTask makes for an issue, so failing it stands in for anything that can go
+// wrong while evaluating one.
+func twoIssueServer(t *testing.T, refuseFirst func(w http.ResponseWriter)) *github.Client {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "/issues/7/"):
+			refuseFirst(w)
+		case strings.HasSuffix(r.URL.Path, "/timeline"):
+			_ = json.NewEncoder(w).Encode([]*githubv39.Timeline{})
+		case strings.HasSuffix(r.URL.Path, "/labels"):
+			_ = json.NewEncoder(w).Encode([]*githubv39.Label{})
+		default:
+			_, _ = w.Write([]byte("{}"))
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	gh := githubv39.NewClient(nil)
+	gh.BaseURL, _ = url.Parse(server.URL + "/")
+	return github.ForRepo(gh, "test-owner", "test-repo")
+}
+
+// TestQueueTasks_SkipsTheIssueThatFailsForItsOwnReasons pins the isolation
+// between issues: one issue the scanner cannot read must not cost the issues
+// behind it their turn, because nothing about the next cycle makes that issue
+// readable and the queue would simply stop at it every time.
+func TestQueueTasks_SkipsTheIssueThatFailsForItsOwnReasons(t *testing.T) {
+	gh := twoIssueServer(t, func(w http.ResponseWriter) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"message":"Server Error"}`))
+	})
+	s, queue, _ := newScanner(t, Config{}, Deps{GitHub: gh})
+
+	issues := []*githubv39.Issue{
+		{Number: githubv39.Int(7)},
+		{Number: githubv39.Int(8)},
+	}
+	if err := s.queueTasks(context.Background(), issues, map[int]bool{}); err != nil {
+		t.Errorf("queueTasks() error = %v, want nil: only a refusal ends the pass", err)
+	}
+	if _, ok := queue.enqueued["task-issue-8.yaml"]; !ok {
+		t.Errorf("issue 8 was not queued after issue 7 failed; queued: %v", queue.enqueued)
+	}
+}
+
+// TestQueueTasks_StopsThePassWhenGitHubRefusesUs is the other half: a refusal is
+// about the quota rather than about the issue, so the issues behind it would
+// only collect the same answer.
+func TestQueueTasks_StopsThePassWhenGitHubRefusesUs(t *testing.T) {
+	gh := twoIssueServer(t, func(w http.ResponseWriter) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}`))
+	})
+	s, queue, _ := newScanner(t, Config{}, Deps{GitHub: gh})
+
+	issues := []*githubv39.Issue{
+		{Number: githubv39.Int(7)},
+		{Number: githubv39.Int(8)},
+	}
+	err := s.queueTasks(context.Background(), issues, map[int]bool{})
+	if err == nil {
+		t.Fatal("queueTasks() error = nil, want the refusal that ended the pass")
+	}
+	if !github.IsRateLimited(err) {
+		t.Errorf("queueTasks() error = %v, want one the backoff recognises as a rate limit", err)
+	}
+	if len(queue.enqueued) != 0 {
+		t.Errorf("queued %v after a refusal, want nothing", queue.enqueued)
 	}
 }

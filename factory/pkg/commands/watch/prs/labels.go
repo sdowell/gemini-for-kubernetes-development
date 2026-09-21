@@ -21,13 +21,16 @@ import (
 // what makes 'overseer/stop' on an issue actually stop work on its pull
 // request, which is why the caller re-checks the stop label immediately after
 // calling this.
-func (s *Scanner) syncReferencedIssueLabels(ctx context.Context, pr *githubv39.PullRequest, prIssue *githubv39.Issue) {
+//
+// An issue that cannot be read stops the sync rather than being skipped. The
+// label that matters most here is the stop label, and skipping the issue that
+// carries it would hand the caller a pull request that looks unpaused.
+func (s *Scanner) syncReferencedIssueLabels(ctx context.Context, pr *githubv39.PullRequest, prIssue *githubv39.Issue) error {
 	var refIssues []*githubv39.Issue
 	for refIssueNum := range common.GetReferencedIssues(pr) {
 		refIssue, err := s.gh.GetIssue(ctx, refIssueNum)
 		if err != nil {
-			klog.Warningf("Failed to fetch referenced parent issue #%d for PR #%d: %v", refIssueNum, pr.GetNumber(), err)
-			continue
+			return fmt.Errorf("fetching referenced parent issue #%d for PR #%d: %w", refIssueNum, pr.GetNumber(), err)
 		}
 		refIssues = append(refIssues, refIssue)
 	}
@@ -37,9 +40,10 @@ func (s *Scanner) syncReferencedIssueLabels(ctx context.Context, pr *githubv39.P
 	if len(allMissingLabels) > 0 {
 		klog.Infof("Adding inherited labels %v to PR #%d", allMissingLabels, pr.GetNumber())
 		if err := s.gh.AddLabels(ctx, pr.GetNumber(), allMissingLabels); err != nil {
-			klog.Errorf("Failed to add labels %v to PR #%d: %v", allMissingLabels, pr.GetNumber(), err)
+			return fmt.Errorf("adding labels %v to PR #%d: %w", allMissingLabels, pr.GetNumber(), err)
 		}
 	}
+	return nil
 }
 
 // getMissingLabelsForPR returns the labels present on the referenced issues but
@@ -127,17 +131,25 @@ func hasReviewLabel(labels []*githubv39.Label, triggerLabel string) bool {
 //
 // Review is opt-in rather than universal because it costs an agent run per
 // commit; the label is how a repository says a change is worth that.
-func (s *Scanner) shouldAutoReviewPR(ctx context.Context, pr *githubv39.PullRequest, prIssue *githubv39.Issue) bool {
+//
+// An unreadable parent issue is an error rather than a "no". Answering "no"
+// would look exactly like a repository that never asked for review, and the
+// pull request would quietly go unreviewed and then be labelled ready for a
+// human on the strength of a review that never happened.
+func (s *Scanner) shouldAutoReviewPR(ctx context.Context, pr *githubv39.PullRequest, prIssue *githubv39.Issue) (bool, error) {
 	if hasReviewLabel(prIssue.Labels, s.cfg.TriggerLabel) {
-		return true
+		return true, nil
 	}
 	for refIssueNum := range common.GetReferencedIssues(pr) {
 		refIssue, err := s.gh.GetIssue(ctx, refIssueNum)
-		if err == nil && hasReviewLabel(refIssue.Labels, s.cfg.TriggerLabel) {
-			return true
+		if err != nil {
+			return false, fmt.Errorf("fetching referenced issue #%d for PR #%d: %w", refIssueNum, pr.GetNumber(), err)
+		}
+		if hasReviewLabel(refIssue.Labels, s.cfg.TriggerLabel) {
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // readyForHumanLabel returns the label marking a pull request as done with
@@ -194,9 +206,9 @@ func (s *Scanner) hasCompletedBotReviewOnHead(reviews []*githubv39.PullRequestRe
 // a pull request that was ready and then had CI break or a review land must
 // stop advertising itself as done, or a human will review a change the watcher
 // is about to push over.
-func (s *Scanner) reconcileReadyForHumanLabel(ctx context.Context, num int, prIssue *githubv39.Issue, isReady bool, headSHA string) {
+func (s *Scanner) reconcileReadyForHumanLabel(ctx context.Context, num int, prIssue *githubv39.Issue, isReady bool, headSHA string) error {
 	if !s.gh.Ready() || prIssue == nil {
-		return
+		return nil
 	}
 	readyLabel := readyForHumanLabel(s.cfg.TriggerLabel)
 	hasLabel := hasReadyForHumanLabel(prIssue.Labels, s.cfg.TriggerLabel)
@@ -207,7 +219,7 @@ func (s *Scanner) reconcileReadyForHumanLabel(ctx context.Context, num int, prIs
 		} else {
 			klog.Infof("PR #%d passed automated review on SHA %s. Adding label '%s'.", num, headSHA, readyLabel)
 			if err := s.gh.AddLabels(ctx, num, []string{readyLabel}); err != nil {
-				klog.Errorf("Failed to add label '%s' to PR #%d: %v", readyLabel, num, err)
+				return fmt.Errorf("adding label %q to PR #%d: %w", readyLabel, num, err)
 			}
 		}
 	} else if !isReady && hasLabel {
@@ -216,8 +228,9 @@ func (s *Scanner) reconcileReadyForHumanLabel(ctx context.Context, num int, prIs
 		} else {
 			klog.Infof("PR #%d is no longer ready for human review. Removing label '%s'.", num, readyLabel)
 			if err := s.gh.RemoveLabel(ctx, num, readyLabel); err != nil {
-				klog.Errorf("Failed to remove label '%s' from PR #%d: %v", readyLabel, num, err)
+				return fmt.Errorf("removing label %q from PR #%d: %w", readyLabel, num, err)
 			}
 		}
 	}
+	return nil
 }

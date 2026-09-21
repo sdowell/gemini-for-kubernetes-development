@@ -167,7 +167,10 @@ func TestCommentStateReadsOncePerComment(t *testing.T) {
 	}}
 	interpreter := NewReactionInterpreter(lister, testSelfLogin, testBots())
 
-	state := interpreter.CommentState(context.Background(), 42)
+	state, err := interpreter.CommentState(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("CommentState() error = %v, want nil", err)
+	}
 
 	if lister.calls != 1 {
 		t.Errorf("IssueCommentReactions called %d times, want 1", lister.calls)
@@ -181,28 +184,35 @@ func TestCommentStateReadsOncePerComment(t *testing.T) {
 	}
 }
 
-// TestCommentStateFetchFailure pins the failure direction. Reading an
-// unreachable comment as unmarked makes the watcher redo work; reading it as
-// handled would drop the feedback silently, which is the worse outcome.
+// TestCommentStateFetchFailure pins that an unreadable comment is reported
+// rather than guessed at. Answering "unmarked" would be indistinguishable from
+// a comment nobody has touched, and under a rate limit every comment would
+// answer that way at once - re-acknowledging and re-queueing a thread's worth
+// of feedback that had already been handled.
 func TestCommentStateFetchFailure(t *testing.T) {
 	lister := &fakeReactionLister{err: errors.New("github is down")}
 	interpreter := NewReactionInterpreter(lister, testSelfLogin, testBots())
 
-	state := interpreter.CommentState(context.Background(), 42)
+	state, err := interpreter.CommentState(context.Background(), 42)
 
-	if state != (CommentState{}) {
-		t.Errorf("CommentState() = %+v, want zero value", state)
+	if err == nil {
+		t.Fatal("CommentState() error = nil, want the fetch failure")
 	}
-	if !state.NeedsAttention() {
-		t.Error("NeedsAttention() = false, want true: a failed read must not drop feedback")
+	if state != (CommentState{}) {
+		t.Errorf("CommentState() = %+v, want zero value alongside the error", state)
 	}
 }
 
 // TestCommentStateWithoutLister covers the scanner constructed without a GitHub
-// client, which several tests and dry runs do.
+// client, which several tests and dry runs do. No client is not a failure, so
+// this reads as a comment with no reactions rather than as an error.
 func TestCommentStateWithoutLister(t *testing.T) {
 	interpreter := NewReactionInterpreter(nil, testSelfLogin, testBots())
-	if got := interpreter.CommentState(context.Background(), 42); got != (CommentState{}) {
+	got, err := interpreter.CommentState(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("CommentState() error = %v, want nil", err)
+	}
+	if got != (CommentState{}) {
 		t.Errorf("CommentState() = %+v, want zero value", got)
 	}
 }

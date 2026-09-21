@@ -2,6 +2,7 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,11 +26,23 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 	if w.Once {
 		w.reconciler.ReconcileOnce(ctx)
+
+		// A failed scan does not abandon the run: whatever it queued before
+		// failing still deserves to be dispatched and waited on. The failure is
+		// held and reported through the exit status, so that a one-shot run cut
+		// short by a rate limit is not mistaken for one that found nothing.
+		var scanErr error
 		if w.issuesEnabled() {
-			w.issueScanner.ScanOnce(ctx)
+			if err := w.issueScanner.ScanOnce(ctx); err != nil {
+				klog.Errorf("Issue scan failed: %v", err)
+				scanErr = errors.Join(scanErr, err)
+			}
 		}
 		if w.prsEnabled() {
-			w.prScanner.ScanOnce(ctx)
+			if err := w.prScanner.ScanOnce(ctx); err != nil {
+				klog.Errorf("Pull request scan failed: %v", err)
+				scanErr = errors.Join(scanErr, err)
+			}
 		}
 		if w.choresEnabled() {
 			w.chores.ScheduleOnce(ctx)
@@ -41,7 +54,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 		fmt.Println("Running in once mode. Waiting for active tasks to complete...")
 		w.Wait()
 		fmt.Println("All tasks completed. Exiting.")
-		return nil
+		return scanErr
 	}
 
 	daemonCtx, daemonCancel := context.WithCancel(ctx)
