@@ -29,15 +29,16 @@ type prCommentAnalysis struct {
 // evaluateComments decides whether a pull request has feedback still waiting on
 // the agent.
 //
-// A comment counts as outstanding only if it post-dates all three of: the last
-// commit (a push is taken as the answer to everything said before it), the last
-// address-comments task (whose work is not on GitHub yet), and the last bot
-// reply (which already answered it in the thread). Any one of those being newer
+// A comment counts as outstanding only if it post-dates both the last commit (a
+// push is taken as the answer to everything said before it) and the last
+// address-comments task (whose work is not on GitHub yet). Either being newer
 // means the feedback has been dealt with.
 //
-// Reactions are the second gate. What the emoji on a comment mean, and which
-// of them outrank the others, is conventions.CommentState's business; this
-// function only asks whether the comment still needs attention.
+// Reactions are the second gate, and the more precise one: they record what
+// became of one particular comment rather than when the watcher was last busy.
+// What the emoji mean, and which of them outrank the others, is
+// conventions.CommentState's business; this function only asks whether the
+// comment still needs attention.
 //
 // Human feedback always wins. Bot review feedback is held back when an
 // address-comments task already ran against this exact commit, because the
@@ -57,20 +58,6 @@ func (s *Scanner) evaluateComments(
 	reviews := history.reviews
 	revCommentsMap := history.revCommentsMap
 	bots := s.cfg.AllowlistedBots
-
-	// Find the latest timestamp of any reply made by an allowlisted bot user
-	// (excluding reviewer bots, whose reviews are feedback rather than replies).
-	var latestBotReplyTime time.Time
-	for _, c := range comments {
-		if !conventions.IsReviewerBot(c.GetUser(), s.cfg.ReviewerLogins) && conventions.IsBotReply(c.GetUser(), s.cfg.GitHubLogin, bots) && c.GetCreatedAt().After(latestBotReplyTime) {
-			latestBotReplyTime = c.GetCreatedAt()
-		}
-	}
-	for _, r := range reviews {
-		if !conventions.IsReviewerBot(r.GetUser(), s.cfg.ReviewerLogins) && conventions.IsBotReply(r.GetUser(), s.cfg.GitHubLogin, bots) && r.GetSubmittedAt().After(latestBotReplyTime) {
-			latestBotReplyTime = r.GetSubmittedAt()
-		}
-	}
 
 	hasNewHumanComments := false
 	hasNewBotReviews := false
@@ -96,7 +83,7 @@ func (s *Scanner) evaluateComments(
 		if conventions.HasIgnorePrefix(c.GetBody(), s.cfg.TriggerLabel) {
 			continue
 		}
-		if c.GetCreatedAt().After(lastCommitTime) && c.GetCreatedAt().After(lastCommentAddressedTime) && c.GetCreatedAt().After(latestBotReplyTime) {
+		if c.GetCreatedAt().After(lastCommitTime) && c.GetCreatedAt().After(lastCommentAddressedTime) {
 			if !s.reactions.CommentState(ctx, c.GetID()).NeedsAttention() {
 				continue
 			}
@@ -118,15 +105,12 @@ func (s *Scanner) evaluateComments(
 	for _, r := range reviews {
 		isReviewer := conventions.IsReviewerBot(r.GetUser(), s.cfg.ReviewerLogins)
 		if !isReviewer && conventions.ShouldIgnoreUser(r.GetUser(), s.cfg.GitHubLogin, bots) {
-			if r.GetSubmittedAt().After(latestBotReplyTime) {
-				latestBotReplyTime = r.GetSubmittedAt()
-			}
 			continue
 		}
 		if strings.EqualFold(r.GetUser().GetLogin(), pr.GetUser().GetLogin()) {
 			continue
 		}
-		if r.GetSubmittedAt().After(lastCommitTime) && r.GetSubmittedAt().After(lastCommentAddressedTime) && r.GetSubmittedAt().After(latestBotReplyTime) {
+		if r.GetSubmittedAt().After(lastCommitTime) && r.GetSubmittedAt().After(lastCommentAddressedTime) {
 			if conventions.HasIgnorePrefix(r.GetBody(), s.cfg.TriggerLabel) {
 				continue
 			}
@@ -157,15 +141,12 @@ func (s *Scanner) evaluateComments(
 		for _, rc := range revComments {
 			isInlineReviewer := conventions.IsReviewerBot(rc.GetUser(), s.cfg.ReviewerLogins)
 			if !isInlineReviewer && conventions.ShouldIgnoreUser(rc.GetUser(), s.cfg.GitHubLogin, bots) {
-				if rc.GetCreatedAt().After(latestBotReplyTime) {
-					latestBotReplyTime = rc.GetCreatedAt()
-				}
 				continue
 			}
 			if strings.EqualFold(rc.GetUser().GetLogin(), pr.GetUser().GetLogin()) {
 				continue
 			}
-			if rc.GetCreatedAt().After(lastCommitTime) && rc.GetCreatedAt().After(lastCommentAddressedTime) && rc.GetCreatedAt().After(latestBotReplyTime) {
+			if rc.GetCreatedAt().After(lastCommitTime) && rc.GetCreatedAt().After(lastCommentAddressedTime) {
 				if conventions.HasIgnorePrefix(rc.GetBody(), s.cfg.TriggerLabel) {
 					continue
 				}
