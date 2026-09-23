@@ -105,6 +105,10 @@ When processing a PR, the scan evaluates conditions and queues tasks in three ph
   * Allowlisted review bots (e.g. `reviewbot-robot` in `allowlistedBots`) are NOT ignored.
 * **`lastCommentAddressedTime`**: written when the task *succeeds*, and set to the time the task was **queued** rather than the time it finished. A failed attempt addressed none of its comments, so it records nothing and the next scan finds them still outstanding. A run can take the better part of an hour, and the agent collects its comments at the start, so dating the work by its completion would file everything posted during the run as already answered. While the task is in flight the duplicate is prevented by `TaskExists` and by the 👀 reactions on the comments themselves.
 * **Assignment**: The bot user stays assigned to the PR on GitHub while addressing comments.
+* **Retry on Failure**: A failed `pr-comments` task is retried up to 3 times against the same head commit, **10 minutes apart**. Each attempt is queued from the same rules and therefore works from the same set of comments — the comments made since the last commit — so a sandbox that died partway through does not cost the reviewer their feedback. The count is recorded on the task (`attempt:` in the task YAML), so it survives a watcher restart.
+  * **Resetting the count**: a successful attempt, a new commit, or any human comment posted since the last failure starts the count over.
+  * **Giving up**: the third consecutive failure marks the comments with `confused` and posts a comment saying automated feedback handling is paused for that commit. Unlike the CI circuit breaker below, **no `overseer/stop` label is applied**: rebases, CI investigation and review keep running. To ask for another attempt, push a commit, leave a comment, or react 🚀 on the comment to revisit.
+  * Between attempts the comments keep only their `eyes` mark. `confused` means the watcher has given up, and GitHub reactions cannot be removed, so it is written only by the final failure.
 
 ### Phase 3: CI Check Failures (`pr-investigate`)
 * **Trigger**: Check runs or status checks for the head commit have failed.

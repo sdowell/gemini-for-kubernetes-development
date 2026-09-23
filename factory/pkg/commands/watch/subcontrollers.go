@@ -293,19 +293,58 @@ func (c *watcherTaskCoordinator) NotifyTaskStarted(ctx context.Context, task *ap
 
 // NotifyTaskFinished reports the outcome of an address-feedback task to the PR
 // scanner and resolves the acknowledgement reactions on the comments it covered.
+//
+// A failure with attempts still owed is deliberately silent. The 'confused'
+// mark means the watcher has given up on a comment, and reactions here can only
+// be added - there is no removal call - so stamping one between attempts would
+// both mislead whoever reads the thread and be impossible to take back. The
+// final failure is the one that gets marked, and the one that says so out loud.
 func (c *watcherTaskCoordinator) NotifyTaskFinished(ctx context.Context, task *api.QueueTask, taskErr error) {
 	w := c.w
 	if task.Type != api.TypePRComments || w.cfg == nil {
 		return
 	}
-	resolution := conventions.ReactionResolved
-	if taskErr != nil {
-		resolution = conventions.ReactionFailed
-	}
 	if w.prScanner != nil {
 		w.prScanner.NoteFeedbackOutcome(task, taskErr)
 	}
-	conventions.ResolveCommentReactions(ctx, w.repoClient, task.Number, resolution, w.cfg.AllowlistedBots, w.githubLogin)
+
+	if taskErr == nil {
+		conventions.ResolveCommentReactions(ctx, w.repoClient, task.Number, conventions.ReactionResolved, w.cfg.AllowlistedBots, w.githubLogin)
+		return
+	}
+
+	// A task queued before attempts were counted carries no number, so it keeps
+	// the single-attempt treatment it was queued under.
+	if task.Attempt > 0 && task.Attempt < api.MaxPRCommentAttempts {
+		klog.Infof("Address-comments task for PR #%d failed on attempt %d of %d; leaving the feedback unmarked for the next attempt.", task.Number, task.Attempt, api.MaxPRCommentAttempts)
+		return
+	}
+
+	if task.Attempt >= api.MaxPRCommentAttempts {
+		if err := w.repoClient.AddComment(ctx, task.Number, giveUpOnFeedbackComment(task)); err != nil {
+			klog.Errorf("Failed to comment on PR #%d after exhausting address-comments attempts: %v", task.Number, err)
+		}
+	}
+
+	conventions.ResolveCommentReactions(ctx, w.repoClient, task.Number, conventions.ReactionFailed, w.cfg.AllowlistedBots, w.githubLogin)
+}
+
+// giveUpOnFeedbackComment is what the watcher says when it stops retrying a
+// pull request's review feedback.
+//
+// No stop label goes with it, unlike the investigation circuit breaker: failing
+// to address feedback is a statement about this feedback on this revision, not
+// about the pull request, and pausing the rebase and CI automation too would
+// strand a change over a comment nobody has to act on.
+func giveUpOnFeedbackComment(task *api.QueueTask) string {
+	revision := task.CommitSHA
+	if len(revision) > 7 {
+		revision = revision[:7]
+	}
+	if revision != "" {
+		revision = fmt.Sprintf(" for commit %s", revision)
+	}
+	return fmt.Sprintf("🤖 AI Factory attempted to address this review feedback %d times without success, and is pausing automated feedback handling%s.\n\nTo ask for another attempt: push a new commit, leave a new comment, or react with 🚀 on the comment you want revisited.", api.MaxPRCommentAttempts, revision)
 }
 
 // taskStartedComment returns the GitHub comment announcing that a task has started,

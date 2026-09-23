@@ -44,6 +44,13 @@ type prCommentAnalysis struct {
 // address-comments task already ran against this exact commit, because the
 // agent looking at the same review and producing no commit means it judged
 // there was nothing to change - running it again would loop forever.
+//
+// A retry sets the reactions aside, which is what makes each attempt work from
+// the same set of comments. The marks record that the watcher took the feedback
+// on, not that it answered it, and the attempt they were written for failed.
+// The timestamps need no such treatment: a failed attempt writes neither of
+// them, so an addressed-at stamp can only have come from an attempt that
+// succeeded.
 func (s *Scanner) evaluateComments(
 	ctx context.Context,
 	num int,
@@ -51,6 +58,7 @@ func (s *Scanner) evaluateComments(
 	history *prHistory,
 	lastCommitTime, lastCommentAddressedTime time.Time,
 	lastCommentAddressedSHA, headSHA string,
+	retry commentRetry,
 ) prCommentAnalysis {
 	var analysis prCommentAnalysis
 
@@ -84,7 +92,7 @@ func (s *Scanner) evaluateComments(
 			continue
 		}
 		if c.GetCreatedAt().After(lastCommitTime) && c.GetCreatedAt().After(lastCommentAddressedTime) {
-			if !s.reactions.CommentState(ctx, c.GetID()).NeedsAttention() {
+			if !s.commentNeedsAttention(ctx, c.GetID(), retry) {
 				continue
 			}
 			if isReviewer {
@@ -153,7 +161,7 @@ func (s *Scanner) evaluateComments(
 				// Reading the marks costs a request, so it is asked last, of
 				// the few comments that everything cheaper has already let
 				// through.
-				if !s.reactions.ReviewCommentState(ctx, rc.GetID()).NeedsAttention() {
+				if !s.reviewCommentNeedsAttention(ctx, rc.GetID(), retry) {
 					continue
 				}
 				if isInlineReviewer {
@@ -182,6 +190,35 @@ func (s *Scanner) evaluateComments(
 	}
 
 	return analysis
+}
+
+// commentNeedsAttention reports whether a conversation comment is still waiting
+// on the watcher, reading its reactions in the light of whether this is a retry.
+//
+// Outside a retry the reactions are taken at face value. Inside one, only the
+// resolved mark still counts: the acknowledgement was written by the attempt
+// being retried and means only that the watcher picked the comment up, which it
+// then failed to act on. Resolved is left standing because it can only have
+// come from an earlier attempt that succeeded on this same head, and that fix
+// is already in the branch.
+//
+// GitHub has no remove-reaction call here, so this is the only place the marks
+// of a failed attempt can be set aside.
+func (s *Scanner) commentNeedsAttention(ctx context.Context, commentID int64, retry commentRetry) bool {
+	return needsAttention(s.reactions.CommentState(ctx, commentID), retry)
+}
+
+// reviewCommentNeedsAttention is commentNeedsAttention for an inline review
+// comment, whose reactions live on their own endpoint.
+func (s *Scanner) reviewCommentNeedsAttention(ctx context.Context, commentID int64, retry commentRetry) bool {
+	return needsAttention(s.reactions.ReviewCommentState(ctx, commentID), retry)
+}
+
+func needsAttention(state conventions.CommentState, retry commentRetry) bool {
+	if retry.active {
+		return !state.Resolved
+	}
+	return state.NeedsAttention()
 }
 
 // hasBotReviewAfterLastCommit reports whether the current head has already been
