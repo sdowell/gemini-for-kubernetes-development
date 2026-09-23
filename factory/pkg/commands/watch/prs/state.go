@@ -21,7 +21,9 @@ type prState struct {
 	lastInvestigatedTime time.Time
 	// lastInvestigatedSHA is the head commit SHA when CI failures were last investigated.
 	lastInvestigatedSHA string
-	// lastCommentAddressedTime is when review feedback was last addressed by the bot.
+	// lastCommentAddressedTime is when the last successful address-comments
+	// attempt was queued. Feedback older than that has been through an agent;
+	// a failed attempt records nothing, so its feedback stays outstanding.
 	lastCommentAddressedTime time.Time
 	// lastCommentAddressedSHA is the head commit SHA when review comments were
 	// last addressed, which prevents processing the same feedback twice on a
@@ -77,6 +79,22 @@ func (s *stateStore) set(num int, state prState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.recoverLocked()
+	s.byNumber[num] = state
+}
+
+// update applies fn to the recorded state for a pull request, holding the lock
+// for the whole read-modify-write.
+//
+// The get-then-set pair either side of a GitHub round trip is fine for the
+// scanner, which owns a pull request for the length of an evaluation. It is not
+// fine for the task coordinator, which records a finished task from the
+// dispatcher's goroutine while a scan of the same pull request may be underway.
+func (s *stateStore) update(num int, fn func(*prState)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recoverLocked()
+	state := s.byNumber[num]
+	fn(&state)
 	s.byNumber[num] = state
 }
 
@@ -145,8 +163,10 @@ func foldProcessedPRTask(t *api.QueueTask, name string, state prState) prState {
 
 	switch {
 	case strings.HasSuffix(name, "-comments"):
-		if tTime.After(state.lastCommentAddressedTime) {
-			state.lastCommentAddressedTime = tTime
+		// Dated by when the attempt was queued, not when it finished - see
+		// attemptStart.
+		if start := attemptStart(t); start.After(state.lastCommentAddressedTime) {
+			state.lastCommentAddressedTime = start
 		}
 		if t.CommitSHA != "" {
 			state.lastCommentAddressedSHA = t.CommitSHA
@@ -171,4 +191,25 @@ func foldProcessedPRTask(t *api.QueueTask, name string, state prState) prState {
 		}
 	}
 	return state
+}
+
+// attemptStart returns the moment an address-comments attempt began, which is
+// the cut-off for the feedback that attempt covers.
+//
+// The agent gathers the comments to address when it runs, so anything posted
+// afterwards was never in front of it. A run can take the better part of an
+// hour, and dating the work by when it finished would file every comment left
+// during it as already answered.
+//
+// The enqueue time is preferred over the start time because that is when the
+// scanner picked the comments out. QueueTask.CreatedAt is no use here: it holds
+// the pull request's creation date, not the task's.
+func attemptStart(t *api.QueueTask) time.Time {
+	if !t.EnqueuedAt.IsZero() {
+		return t.EnqueuedAt
+	}
+	if !t.StartedAt.IsZero() {
+		return t.StartedAt
+	}
+	return t.CompletedAt
 }

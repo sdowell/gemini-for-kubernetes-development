@@ -291,7 +291,8 @@ func (c *watcherTaskCoordinator) NotifyTaskStarted(ctx context.Context, task *ap
 	}
 }
 
-// NotifyTaskFinished resolves the acknowledgement reactions on PR review comments.
+// NotifyTaskFinished reports the outcome of an address-feedback task to the PR
+// scanner and resolves the acknowledgement reactions on the comments it covered.
 func (c *watcherTaskCoordinator) NotifyTaskFinished(ctx context.Context, task *api.QueueTask, taskErr error) {
 	w := c.w
 	if task.Type != api.TypePRComments || w.cfg == nil {
@@ -300,6 +301,9 @@ func (c *watcherTaskCoordinator) NotifyTaskFinished(ctx context.Context, task *a
 	resolution := conventions.ReactionResolved
 	if taskErr != nil {
 		resolution = conventions.ReactionFailed
+	}
+	if w.prScanner != nil {
+		w.prScanner.NoteFeedbackOutcome(task, taskErr)
 	}
 	conventions.ResolveCommentReactions(ctx, w.repoClient, task.Number, resolution, w.cfg.AllowlistedBots, w.githubLogin)
 }

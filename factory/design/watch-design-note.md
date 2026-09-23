@@ -103,6 +103,7 @@ When processing a PR, the scan evaluates conditions and queues tasks in three ph
   * Own watcher bot (`githubLogin`) and PR author comments are ignored.
   * System bots (matching `prow`, `-bot`, `-robot`, or `[bot]`) are ignored by default.
   * Allowlisted review bots (e.g. `reviewbot-robot` in `allowlistedBots`) are NOT ignored.
+* **`lastCommentAddressedTime`**: written when the task *succeeds*, and set to the time the task was **queued** rather than the time it finished. A failed attempt addressed none of its comments, so it records nothing and the next scan finds them still outstanding. A run can take the better part of an hour, and the agent collects its comments at the start, so dating the work by its completion would file everything posted during the run as already answered. While the task is in flight the duplicate is prevented by `TaskExists` and by the 👀 reactions on the comments themselves.
 * **Assignment**: The bot user stays assigned to the PR on GitHub while addressing comments.
 
 ### Phase 3: CI Check Failures (`pr-investigate`)

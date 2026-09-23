@@ -243,7 +243,6 @@ func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAn
 		return
 	}
 	num := pc.prIssue.GetNumber()
-	state := s.state.get(num)
 	filename := fmt.Sprintf("task-pr-%d-comments.yaml", num)
 
 	if s.queue.TaskExists(filename) {
@@ -299,12 +298,36 @@ func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAn
 	for _, cid := range commentAnalysis.unackPRCommentIDs {
 		s.reactToReviewComment(ctx, cid, conventions.ReactionAcknowledged)
 	}
-	state.lastCommentAddressedTime = time.Now()
-	state.lastCommentAddressedSHA = pc.headSHA
-	s.state.set(num, state)
 	if err := s.queue.Enqueue(filename, task); err != nil {
 		klog.Errorf("Failed to queue address-comments task for PR #%d: %v", num, err)
 	}
+}
+
+// NoteFeedbackOutcome records the result of an address-comments task.
+//
+// A success is what stops a later scan from queueing the same feedback again.
+// A failure records nothing: the attempt addressed none of the comments it was
+// dispatched for, so they are still outstanding and the next scan should find
+// them.
+//
+// Nothing is recorded when the task is queued either. A stamp written up front
+// would park the feedback whatever became of the attempt, leaving the reviewer
+// waiting on a reply that was never coming. What keeps the work from being
+// queued twice while it is in flight is the queue's own duplicate check and the
+// acknowledgement reactions on the comments themselves.
+func (s *Scanner) NoteFeedbackOutcome(task *api.QueueTask, taskErr error) {
+	if taskErr != nil || task == nil || task.Number <= 0 {
+		return
+	}
+	start := attemptStart(task)
+	s.state.update(task.Number, func(state *prState) {
+		if start.After(state.lastCommentAddressedTime) {
+			state.lastCommentAddressedTime = start
+		}
+		if task.CommitSHA != "" {
+			state.lastCommentAddressedSHA = task.CommitSHA
+		}
+	})
 }
 
 // handlePRReview queues an automated review of a green, unreviewed pull request.

@@ -20,11 +20,15 @@ func TestFoldProcessedPRTask(t *testing.T) {
 		t.Errorf("expected lastReviewedSHA to be 'abcd123', got '%s'", state.lastReviewedSHA)
 	}
 
+	// Addressed feedback is dated by when the attempt was queued: the agent
+	// never saw anything posted after that, so dating it by the completion
+	// time would file those later comments as answered.
 	expectedCommentTime, _ := time.Parse(time.RFC3339, "2026-07-23T12:00:00Z")
 	state = foldProcessedPRTask(&api.QueueTask{
 		Type:        api.TypePRComments,
 		CommitSHA:   "csha789",
-		CompletedAt: expectedCommentTime,
+		EnqueuedAt:  expectedCommentTime,
+		CompletedAt: expectedCommentTime.Add(40 * time.Minute),
 	}, "task-pr-123-comments", state)
 	if !state.lastCommentAddressedTime.Equal(expectedCommentTime) {
 		t.Errorf("expected lastCommentAddressedTime to be %v, got %v", expectedCommentTime, state.lastCommentAddressedTime)
