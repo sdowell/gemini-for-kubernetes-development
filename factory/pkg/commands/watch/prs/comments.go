@@ -130,14 +130,21 @@ func (s *Scanner) evaluateComments(
 			if conventions.HasIgnorePrefix(r.GetBody(), s.cfg.TriggerLabel) {
 				continue
 			}
-			if isReviewer {
-				hasNewBotReviews = true
-			} else {
-				hasNewHumanComments = true
-			}
 			// A review with an empty body carries no instruction of its own -
-			// its inline comments below are the feedback.
+			// its inline comments below are the feedback, and each of them is
+			// judged on its own marks further down.
+			//
+			// This has to hold for the flags too, not just for the bookkeeping.
+			// A review cannot carry a reaction - GitHub has nowhere to put one -
+			// so an empty review that raised the flag by itself could never be
+			// answered, and would keep the feedback outstanding however the
+			// comments beneath it were marked.
 			if strings.TrimSpace(r.GetBody()) != "" {
+				if isReviewer {
+					hasNewBotReviews = true
+				} else {
+					hasNewHumanComments = true
+				}
 				author := ""
 				if r.GetUser() != nil {
 					author = r.GetUser().GetLogin()
@@ -160,6 +167,12 @@ func (s *Scanner) evaluateComments(
 			}
 			if rc.GetCreatedAt().After(lastCommitTime) && rc.GetCreatedAt().After(lastCommentAddressedTime) && rc.GetCreatedAt().After(latestBotReplyTime) {
 				if conventions.HasIgnorePrefix(rc.GetBody(), s.cfg.TriggerLabel) {
+					continue
+				}
+				// Reading the marks costs a request, so it is asked last, of
+				// the few comments that everything cheaper has already let
+				// through.
+				if !s.reactions.ReviewCommentState(ctx, rc.GetID()).NeedsAttention() {
 					continue
 				}
 				if isInlineReviewer {

@@ -79,9 +79,17 @@ func (s CommentState) NeedsAttention() bool {
 // needs. Fetching is the client's job and interpretation is this package's, and
 // the seam between them is what lets the rules above be exercised without a
 // GitHub server.
+//
+// The two kinds of comment are separate resources behind separate endpoints,
+// and their IDs are drawn from separate sequences. A caller therefore has to
+// say which kind it holds - there is no way to tell from the number, and
+// guessing wrong can return the reactions of an unrelated comment.
 type ReactionLister interface {
-	// IssueCommentReactions returns the reactions recorded on a comment.
+	// IssueCommentReactions returns the reactions recorded on a conversation comment.
 	IssueCommentReactions(ctx context.Context, commentID int64) ([]*githubv39.Reaction, error)
+	// PullRequestCommentReactions returns the reactions recorded on an inline
+	// review comment.
+	PullRequestCommentReactions(ctx context.Context, commentID int64) ([]*githubv39.Reaction, error)
 }
 
 // ReactionInterpreter turns the reactions on a comment into a CommentState.
@@ -102,7 +110,7 @@ func NewReactionInterpreter(lister ReactionLister, selfLogin string, bots []stri
 	return &ReactionInterpreter{lister: lister, selfLogin: selfLogin, bots: bots}
 }
 
-// CommentState fetches a comment's reactions and interprets them.
+// CommentState fetches a conversation comment's reactions and interprets them.
 //
 // One request covers every reaction on the comment, which is the point of
 // returning the whole state instead of answering one emoji at a time: the
@@ -116,7 +124,19 @@ func (i *ReactionInterpreter) CommentState(ctx context.Context, commentID int64)
 	if i == nil || i.lister == nil {
 		return CommentState{}
 	}
-	reactions, err := i.lister.IssueCommentReactions(ctx, commentID)
+	return i.stateFrom(i.lister.IssueCommentReactions(ctx, commentID))
+}
+
+// ReviewCommentState is CommentState for an inline review comment, which lives
+// behind a different endpoint and must never be looked up through the other.
+func (i *ReactionInterpreter) ReviewCommentState(ctx context.Context, commentID int64) CommentState {
+	if i == nil || i.lister == nil {
+		return CommentState{}
+	}
+	return i.stateFrom(i.lister.PullRequestCommentReactions(ctx, commentID))
+}
+
+func (i *ReactionInterpreter) stateFrom(reactions []*githubv39.Reaction, err error) CommentState {
 	if err != nil {
 		return CommentState{}
 	}

@@ -90,3 +90,21 @@ func (c *Client) AddPullRequestCommentReaction(ctx context.Context, commentID in
 	}
 	return nil
 }
+
+// PullRequestCommentReactions returns the reactions recorded on a single inline
+// review comment.
+//
+// The same namespace warning as above applies in reverse: passing an inline
+// comment's ID to IssueCommentReactions does not merely fail, it can find an
+// unrelated conversation comment that happens to share the number.
+func (c *Client) PullRequestCommentReactions(ctx context.Context, commentID int64) ([]*githubv39.Reaction, error) {
+	if !c.Ready() {
+		return nil, errNoClient
+	}
+
+	reactions, _, err := c.gh.Reactions.ListPullRequestCommentReactions(ctx, c.owner, c.repo, commentID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("listing reactions on review comment %d: %w", commentID, err)
+	}
+	return reactions, nil
+}

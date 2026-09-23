@@ -146,15 +146,27 @@ func TestNeedsAttention(t *testing.T) {
 }
 
 // fakeReactionLister serves a canned reaction set, or an error.
+//
+// The two endpoints are answered from separate fields even though most tests
+// only use one. Which endpoint a caller reaches for is the thing most worth
+// catching here: the two take the same argument type, so a mix-up compiles
+// cleanly and fails only against real GitHub.
 type fakeReactionLister struct {
-	reactions []*githubv39.Reaction
-	err       error
-	calls     int
+	reactions       []*githubv39.Reaction
+	reviewReactions []*githubv39.Reaction
+	err             error
+	calls           int
+	reviewCalls     int
 }
 
 func (f *fakeReactionLister) IssueCommentReactions(_ context.Context, _ int64) ([]*githubv39.Reaction, error) {
 	f.calls++
 	return f.reactions, f.err
+}
+
+func (f *fakeReactionLister) PullRequestCommentReactions(_ context.Context, _ int64) ([]*githubv39.Reaction, error) {
+	f.reviewCalls++
+	return f.reviewReactions, f.err
 }
 
 // TestCommentStateReadsOncePerComment guards the reason the whole state is
@@ -204,5 +216,54 @@ func TestCommentStateWithoutLister(t *testing.T) {
 	interpreter := NewReactionInterpreter(nil, testSelfLogin, testBots())
 	if got := interpreter.CommentState(context.Background(), 42); got != (CommentState{}) {
 		t.Errorf("CommentState() = %+v, want zero value", got)
+	}
+	if got := interpreter.ReviewCommentState(context.Background(), 42); got != (CommentState{}) {
+		t.Errorf("ReviewCommentState() = %+v, want zero value", got)
+	}
+}
+
+// TestReviewCommentStateUsesItsOwnEndpoint is the test that matters for inline
+// comments.
+//
+// Both lookups take an int64, and the two kinds of comment number their
+// resources separately, so asking the conversation endpoint about an inline
+// comment is a mistake the compiler cannot catch. It would usually answer "no
+// such comment" - which reads as unmarked, and quietly re-sends feedback that
+// was already handled - and can occasionally answer with the reactions of an
+// unrelated comment that happens to share the number.
+func TestReviewCommentStateUsesItsOwnEndpoint(t *testing.T) {
+	lister := &fakeReactionLister{
+		reactions:       []*githubv39.Reaction{reaction(ReactionRedo, testHuman)},
+		reviewReactions: []*githubv39.Reaction{reaction(ReactionResolved, testSelfLogin)},
+	}
+	interpreter := NewReactionInterpreter(lister, testSelfLogin, testBots())
+
+	state := interpreter.ReviewCommentState(context.Background(), 42)
+
+	if lister.reviewCalls != 1 || lister.calls != 0 {
+		t.Errorf("read the review endpoint %d times and the conversation endpoint %d times, want 1 and 0", lister.reviewCalls, lister.calls)
+	}
+	if want := (CommentState{Resolved: true}); state != want {
+		t.Errorf("ReviewCommentState() = %+v, want %+v", state, want)
+	}
+	if state.NeedsAttention() {
+		t.Error("NeedsAttention() = true, want false: the inline comment is resolved")
+	}
+}
+
+// TestReviewCommentStateFetchFailure pins the same failure direction as the
+// conversation path: unreachable reads as unmarked, so the work is repeated
+// rather than dropped.
+func TestReviewCommentStateFetchFailure(t *testing.T) {
+	lister := &fakeReactionLister{err: errors.New("github is down")}
+	interpreter := NewReactionInterpreter(lister, testSelfLogin, testBots())
+
+	state := interpreter.ReviewCommentState(context.Background(), 42)
+
+	if state != (CommentState{}) {
+		t.Errorf("ReviewCommentState() = %+v, want zero value", state)
+	}
+	if !state.NeedsAttention() {
+		t.Error("NeedsAttention() = false, want true: a failed read must not drop feedback")
 	}
 }

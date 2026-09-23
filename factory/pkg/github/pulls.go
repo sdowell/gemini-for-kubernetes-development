@@ -112,6 +112,32 @@ func (c *Client) ListReviewComments(ctx context.Context, number int, reviewID in
 	}
 }
 
+// ListPullRequestComments returns every inline review comment on a pull
+// request, following pagination.
+//
+// ListReviewComments above answers "what did this review say"; this answers
+// "what inline comments exist at all", which a caller walking the whole pull
+// request would otherwise have to assemble one review at a time.
+func (c *Client) ListPullRequestComments(ctx context.Context, number int) ([]*githubv39.PullRequestComment, error) {
+	if !c.Ready() {
+		return nil, errNoClient
+	}
+
+	var all []*githubv39.PullRequestComment
+	opt := &githubv39.PullRequestListCommentsOptions{ListOptions: githubv39.ListOptions{PerPage: 100}}
+	for {
+		comments, resp, err := c.gh.PullRequests.ListComments(ctx, c.owner, c.repo, number, opt)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, comments...)
+		if resp == nil || resp.NextPage == 0 {
+			return all, nil
+		}
+		opt.Page = resp.NextPage
+	}
+}
+
 // IsInMergeQueue reports whether a pull request is currently sitting in the
 // repository's merge queue.
 func (c *Client) IsInMergeQueue(ctx context.Context, number int) (bool, error) {
