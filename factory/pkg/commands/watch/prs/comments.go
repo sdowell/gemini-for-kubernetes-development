@@ -193,13 +193,53 @@ func (s *Scanner) evaluateComments(
 // hasBotReviewAfterLastCommit reports whether the current head has already been
 // reviewed by a bot, which is what stops a second review being queued for the
 // same revision.
-func hasBotReviewAfterLastCommit(reviews []*githubv39.PullRequestReview, lastCommitTime time.Time, headSHA, githubLogin string, bots []string) bool {
+func hasBotReviewAfterLastCommit(reviews []*githubv39.PullRequestReview, lastCommitTime time.Time, headSHA, githubLogin string, bots []string, reviewerLogins ...string) bool {
 	for _, r := range reviews {
-		if conventions.IsBotReply(r.GetUser(), githubLogin, bots) && (r.GetSubmittedAt().After(lastCommitTime) || r.GetCommitID() == headSHA) {
+		isBotReviewer := conventions.IsReviewerBot(r.GetUser(), reviewerLogins) || conventions.IsBotReply(r.GetUser(), githubLogin, bots)
+		if isBotReviewer && (r.GetSubmittedAt().After(lastCommitTime) || r.GetCommitID() == headSHA) {
 			return true
 		}
 	}
 	return false
+}
+
+// getReviewCount counts how many times the watcher has started an automated
+// code review in a sandbox since the last commit or human comment reset.
+func getReviewCount(comments []*githubv39.IssueComment, lastCommitTime time.Time, allBotUsers []string, githubLogin string, bots []string, triggerLabel string) int {
+	lastResetTime := lastCommitTime
+	for _, c := range comments {
+		isPoolBot := strings.EqualFold(c.GetUser().GetLogin(), githubLogin)
+		for _, bot := range allBotUsers {
+			if strings.EqualFold(c.GetUser().GetLogin(), bot) {
+				isPoolBot = true
+				break
+			}
+		}
+		isHuman := !isPoolBot && !conventions.ShouldIgnoreUser(c.GetUser(), githubLogin, bots)
+		if isHuman && conventions.HasIgnorePrefix(c.GetBody(), triggerLabel) {
+			isHuman = false
+		}
+		if (isHuman || strings.Contains(c.GetBody(), "pausing automated review")) && c.GetCreatedAt().After(lastResetTime) {
+			lastResetTime = c.GetCreatedAt()
+		}
+	}
+
+	reviewCount := 0
+	for _, c := range comments {
+		isPoolBot := strings.EqualFold(c.GetUser().GetLogin(), githubLogin)
+		for _, bot := range allBotUsers {
+			if strings.EqualFold(c.GetUser().GetLogin(), bot) {
+				isPoolBot = true
+				break
+			}
+		}
+		if isPoolBot &&
+			strings.Contains(c.GetBody(), "started reviewing this pull request in a sandbox") &&
+			c.GetCreatedAt().After(lastResetTime) {
+			reviewCount++
+		}
+	}
+	return reviewCount
 }
 
 // getInvestigationCount counts how many times the watcher has investigated CI

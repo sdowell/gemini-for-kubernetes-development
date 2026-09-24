@@ -168,7 +168,9 @@ func hasReadyForHumanLabel(labels []*githubv39.Label, triggerLabel string) bool 
 func (s *Scanner) hasCompletedBotReviewOnHead(reviews []*githubv39.PullRequestReview, headSHA string, lastCommitTime time.Time) bool {
 	var latestReview *githubv39.PullRequestReview
 	for _, r := range reviews {
-		if conventions.IsReviewerBot(r.GetUser(), s.cfg.ReviewerLogins) && (r.GetSubmittedAt().After(lastCommitTime) || r.GetCommitID() == headSHA) {
+		isReviewer := conventions.IsReviewerBot(r.GetUser(), s.cfg.ReviewerLogins) ||
+			(len(s.cfg.ReviewerLogins) == 0 && s.cfg.GitHubLogin != "" && strings.EqualFold(r.GetUser().GetLogin(), s.cfg.GitHubLogin))
+		if isReviewer && (r.GetSubmittedAt().After(lastCommitTime) || r.GetCommitID() == headSHA) {
 			if latestReview == nil || r.GetSubmittedAt().After(latestReview.GetSubmittedAt()) {
 				latestReview = r
 			}

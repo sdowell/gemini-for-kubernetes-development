@@ -106,6 +106,9 @@ func TestProcessedPRStates(t *testing.T) {
 	if state.lastReviewedSHA != "sha-rev" {
 		t.Errorf("expected lastReviewedSHA 'sha-rev', got %q", state.lastReviewedSHA)
 	}
+	if !state.lastReviewedTime.Equal(at("2026-08-01T13:00:00Z")) {
+		t.Errorf("expected lastReviewedTime '2026-08-01T13:00:00Z', got %v", state.lastReviewedTime)
+	}
 	if state.lastIteratedSHA != "sha-iter" {
 		t.Errorf("expected lastIteratedSHA 'sha-iter', got %q", state.lastIteratedSHA)
 	}

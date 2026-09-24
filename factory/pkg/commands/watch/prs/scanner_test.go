@@ -1686,3 +1686,248 @@ func TestFastPass_ReevaluatesWhenMergeableUnknown(t *testing.T) {
 		t.Error("a pull request whose Mergeable state was unknown on the previous pass was skipped")
 	}
 }
+
+// TestEvaluate_RetriesStaleCompletedReviewWithoutGitHubReview reproduces the
+// split-brain deadlock where a review task completed in processed/ (e.g. after
+// sandbox adoption) without a review ever appearing on GitHub for headSHA.
+// Once reviewPropagationGracePeriod has elapsed, the scanner must re-queue the
+// review task instead of leaving canReview=false and ready-for-human=false.
+func TestEvaluate_RetriesStaleCompletedReviewWithoutGitHubReview(t *testing.T) {
+	tempDir := t.TempDir()
+	incomingDir := filepath.Join(tempDir, "incoming")
+	processingDir := filepath.Join(tempDir, "processing")
+	processedDir := filepath.Join(tempDir, "processed")
+	_ = os.MkdirAll(incomingDir, 0755)
+	_ = os.MkdirAll(processingDir, 0755)
+	_ = os.MkdirAll(processedDir, 0755)
+
+	prNum := 13065
+	headSHA := "47b0e3f27370fb9e89fb49ba61f68149aa433598"
+	commitTime := time.Now().Add(-2 * time.Hour)
+	staleCompletedAt := time.Now().Add(-30 * time.Minute)
+
+	// Write a processed review task that completed 30m ago (> reviewPropagationGracePeriod)
+	// for the current headSHA, simulating an adopted task that never ran finishReview.
+	staleTaskYAML := fmt.Sprintf(
+		"type: pr-review\nnumber: %d\nstatus: Completed\ncommitSHA: %s\ncompletedAt: %s\n",
+		prNum, headSHA, staleCompletedAt.Format(time.RFC3339),
+	)
+	if err := os.WriteFile(filepath.Join(processedDir, fmt.Sprintf("task-pr-%d-review.yaml", prNum)), []byte(staleTaskYAML), 0644); err != nil {
+		t.Fatalf("writing processed review task: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "GET" && r.URL.Path == fmt.Sprintf("/repos/test-owner/test-repo/pulls/%d", prNum):
+			mergeable := true
+			pr := &githubv39.PullRequest{
+				Number:    &prNum,
+				State:     stringPtr("open"),
+				Mergeable: &mergeable,
+				Head:      &githubv39.PullRequestBranch{SHA: &headSHA},
+				User:      &githubv39.User{Login: stringPtr("bot1")},
+			}
+			_ = json.NewEncoder(w).Encode(pr)
+		case r.Method == "GET" && r.URL.Path == fmt.Sprintf("/repos/test-owner/test-repo/pulls/%d/commits", prNum):
+			commits := []*githubv39.RepositoryCommit{
+				{
+					SHA:    &headSHA,
+					Commit: &githubv39.Commit{Committer: &githubv39.CommitAuthor{Date: &commitTime}},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(commits)
+		case r.Method == "GET" && r.URL.Path == fmt.Sprintf("/repos/test-owner/test-repo/issues/%d/comments", prNum):
+			_ = json.NewEncoder(w).Encode([]*githubv39.IssueComment{})
+		case r.Method == "GET" && r.URL.Path == fmt.Sprintf("/repos/test-owner/test-repo/pulls/%d/reviews", prNum):
+			// No reviews on GitHub!
+			_ = json.NewEncoder(w).Encode([]*githubv39.PullRequestReview{})
+		case r.Method == "GET" && r.URL.Path == fmt.Sprintf("/repos/test-owner/test-repo/pulls/%d/comments", prNum):
+			_ = json.NewEncoder(w).Encode([]*githubv39.PullRequestComment{})
+		case r.Method == "GET" && r.URL.Path == "/repos/test-owner/test-repo/commits/"+headSHA+"/check-runs":
+			runs := []*githubv39.CheckRun{
+				{
+					ID:         githubv39.Int64(1),
+					Name:       stringPtr("tests"),
+					Status:     stringPtr("completed"),
+					Conclusion: stringPtr("success"),
+				},
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"check_runs": runs})
+		case r.Method == "GET" && r.URL.Path == "/repos/test-owner/test-repo/commits/"+headSHA+"/statuses":
+			_ = json.NewEncoder(w).Encode([]interface{}{})
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{}"))
+		}
+	}))
+	defer server.Close()
+
+	ghClient := githubv39.NewClient(nil)
+	ghClient.BaseURL, _ = url.Parse(server.URL + "/")
+
+	scheme := runtime.NewScheme()
+	fakeDynamic := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, map[schema.GroupVersionResource]string{
+		k8s.SandboxGVR: "SandboxList",
+	})
+	kubeClient := &clients.KubernetesClient{DynamicClient: fakeDynamic}
+
+	s, _ := newTestScanner(t, tempDir, testOpts{
+		GitHub:         ghClient,
+		Kube:           kubeClient,
+		BotUsers:       []string{"bot1"},
+		GitHubLogin:    "bot1",
+		TriggerLabel:   "overseer",
+		ReviewerLogins: []string{"reviewbot"},
+	})
+
+	prIssue := &githubv39.Issue{
+		Number: &prNum,
+		Assignees: []*githubv39.User{
+			{Login: stringPtr("bot1")},
+		},
+		Labels: []*githubv39.Label{
+			{Name: stringPtr("overseer")},
+			{Name: stringPtr("overseer/review")},
+		},
+	}
+
+	s.evaluateAll(context.Background(), []*githubv39.Issue{prIssue})
+
+	reviewTaskFile := filepath.Join(incomingDir, fmt.Sprintf("task-pr-%d-review.yaml", prNum))
+	if _, err := os.Stat(reviewTaskFile); os.IsNotExist(err) {
+		t.Fatalf("expected review task %s to be re-queued when processed review task completed >15m ago without a GitHub review", reviewTaskFile)
+	}
+}
+
+// TestEvaluate_PausesReviewAfterMaxRetries verifies that if a review has been
+// started maxReviews times since the last commit without a review landing on
+// GitHub, the scanner comments and applies the stop label rather than looping.
+func TestEvaluate_PausesReviewAfterMaxRetries(t *testing.T) {
+	tempDir := t.TempDir()
+	incomingDir := filepath.Join(tempDir, "incoming")
+	processingDir := filepath.Join(tempDir, "processing")
+	processedDir := filepath.Join(tempDir, "processed")
+	_ = os.MkdirAll(incomingDir, 0755)
+	_ = os.MkdirAll(processingDir, 0755)
+	_ = os.MkdirAll(processedDir, 0755)
+
+	prNum := 13066
+	headSHA := "abc9999"
+	commitTime := time.Now().Add(-2 * time.Hour)
+
+	var addedStopLabel bool
+	var postedPauseComment bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "GET" && r.URL.Path == fmt.Sprintf("/repos/test-owner/test-repo/pulls/%d", prNum):
+			mergeable := true
+			pr := &githubv39.PullRequest{
+				Number:    &prNum,
+				State:     stringPtr("open"),
+				Mergeable: &mergeable,
+				Head:      &githubv39.PullRequestBranch{SHA: &headSHA},
+				User:      &githubv39.User{Login: stringPtr("bot1")},
+			}
+			_ = json.NewEncoder(w).Encode(pr)
+		case r.Method == "GET" && r.URL.Path == fmt.Sprintf("/repos/test-owner/test-repo/pulls/%d/commits", prNum):
+			commits := []*githubv39.RepositoryCommit{
+				{
+					SHA:    &headSHA,
+					Commit: &githubv39.Commit{Committer: &githubv39.CommitAuthor{Date: &commitTime}},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(commits)
+		case r.Method == "GET" && r.URL.Path == fmt.Sprintf("/repos/test-owner/test-repo/issues/%d/comments", prNum):
+			var comments []*githubv39.IssueComment
+			for i := 0; i < maxReviews; i++ {
+				tAttempt := commitTime.Add(time.Duration(i+1) * 10 * time.Minute)
+				comments = append(comments, &githubv39.IssueComment{
+					ID:        githubv39.Int64(int64(i + 1)),
+					User:      &githubv39.User{Login: stringPtr("bot1")},
+					Body:      stringPtr("🤖 AI Factory started reviewing this pull request in a sandbox."),
+					CreatedAt: &tAttempt,
+				})
+			}
+			_ = json.NewEncoder(w).Encode(comments)
+		case r.Method == "POST" && r.URL.Path == fmt.Sprintf("/repos/test-owner/test-repo/issues/%d/comments", prNum):
+			bodyBytes, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(bodyBytes), "pausing automated review") {
+				postedPauseComment = true
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id": 99}`))
+		case r.Method == "POST" && r.URL.Path == fmt.Sprintf("/repos/test-owner/test-repo/issues/%d/labels", prNum):
+			bodyBytes, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(bodyBytes), "overseer/stop") {
+				addedStopLabel = true
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"name":"overseer/stop"}]`))
+		case r.Method == "GET" && r.URL.Path == fmt.Sprintf("/repos/test-owner/test-repo/pulls/%d/reviews", prNum):
+			_ = json.NewEncoder(w).Encode([]*githubv39.PullRequestReview{})
+		case r.Method == "GET" && r.URL.Path == fmt.Sprintf("/repos/test-owner/test-repo/pulls/%d/comments", prNum):
+			_ = json.NewEncoder(w).Encode([]*githubv39.PullRequestComment{})
+		case r.Method == "GET" && r.URL.Path == "/repos/test-owner/test-repo/commits/"+headSHA+"/check-runs":
+			runs := []*githubv39.CheckRun{
+				{
+					ID:         githubv39.Int64(1),
+					Name:       stringPtr("tests"),
+					Status:     stringPtr("completed"),
+					Conclusion: stringPtr("success"),
+				},
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"check_runs": runs})
+		case r.Method == "GET" && r.URL.Path == "/repos/test-owner/test-repo/commits/"+headSHA+"/statuses":
+			_ = json.NewEncoder(w).Encode([]interface{}{})
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{}"))
+		}
+	}))
+	defer server.Close()
+
+	ghClient := githubv39.NewClient(nil)
+	ghClient.BaseURL, _ = url.Parse(server.URL + "/")
+
+	scheme := runtime.NewScheme()
+	fakeDynamic := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, map[schema.GroupVersionResource]string{
+		k8s.SandboxGVR: "SandboxList",
+	})
+	kubeClient := &clients.KubernetesClient{DynamicClient: fakeDynamic}
+
+	s, _ := newTestScanner(t, tempDir, testOpts{
+		GitHub:         ghClient,
+		Kube:           kubeClient,
+		BotUsers:       []string{"bot1"},
+		GitHubLogin:    "bot1",
+		TriggerLabel:   "overseer",
+		ReviewerLogins: []string{"reviewbot"},
+	})
+
+	prIssue := &githubv39.Issue{
+		Number: &prNum,
+		Assignees: []*githubv39.User{
+			{Login: stringPtr("bot1")},
+		},
+		Labels: []*githubv39.Label{
+			{Name: stringPtr("overseer")},
+			{Name: stringPtr("overseer/review")},
+		},
+	}
+
+	s.evaluateAll(context.Background(), []*githubv39.Issue{prIssue})
+
+	if !postedPauseComment {
+		t.Errorf("expected pause comment to be posted after %d review attempts", maxReviews)
+	}
+	if !addedStopLabel {
+		t.Errorf("expected stop label 'overseer/stop' to be added after %d review attempts", maxReviews)
+	}
+	reviewTaskFile := filepath.Join(incomingDir, fmt.Sprintf("task-pr-%d-review.yaml", prNum))
+	if _, err := os.Stat(reviewTaskFile); !os.IsNotExist(err) {
+		t.Errorf("expected review task NOT to be queued after reaching maxReviews")
+	}
+}

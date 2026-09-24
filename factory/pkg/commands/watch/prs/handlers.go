@@ -31,6 +31,18 @@ const maxInvestigations = 3
 // couple of hours a retry is cheaper than a stuck pull request.
 const investigationRetryAfter = 2 * time.Hour
 
+// maxReviews is how many times an automated code review on the same revision
+// may be attempted without a review landing on GitHub before the watcher gives
+// up and attaches the stop label.
+const maxReviews = 3
+
+// reviewPropagationGracePeriod is how long state.lastReviewedSHA suppresses a
+// duplicate review task while waiting for a finished review task's GitHub
+// review to appear. Once this window passes, if no bot review exists on GitHub
+// for headSHA, the review is re-queued so the PR cannot deadlock between
+// canReview=false and reviewSatisfied=false.
+const reviewPropagationGracePeriod = 15 * time.Minute
+
 // prContext is the per-pull-request facts each handler needs, assembled once so
 // that the handlers do not each re-derive them.
 type prContext struct {
@@ -316,6 +328,45 @@ func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAn
 	return true
 }
 
+// canReviewPR reports whether an automated review should be queued for the
+// current head commit.
+//
+// If a review already exists on GitHub for headSHA, no further review is needed.
+// Otherwise, state.lastReviewedSHA only suppresses re-queueing within
+// reviewPropagationGracePeriod (or when lastReviewedTime is zero in unit tests),
+// preventing a review task that finished without publishing a GitHub review
+// from permanently deadlocking ready-for-human.
+func (s *Scanner) canReviewPR(
+	num int,
+	headSHA string,
+	state prState,
+	reviews []*githubv39.PullRequestReview,
+	comments []*githubv39.IssueComment,
+	lastCommitTime time.Time,
+) bool {
+	filename := fmt.Sprintf("task-pr-%d-review.yaml", num)
+	if s.queue.TaskExists(filename) {
+		return false
+	}
+	if hasBotReviewAfterLastCommit(reviews, lastCommitTime, headSHA, s.cfg.GitHubLogin, s.cfg.AllowlistedBots, s.cfg.ReviewerLogins...) ||
+		s.hasCompletedBotReviewOnHead(reviews, headSHA, lastCommitTime) {
+		return false
+	}
+	if getReviewCount(comments, lastCommitTime, s.cfg.BotUsers, s.cfg.GitHubLogin, s.cfg.AllowlistedBots, s.cfg.TriggerLabel) >= maxReviews {
+		return true
+	}
+	if state.lastReviewedSHA != headSHA || s.lastReviewFailed(filename) {
+		return true
+	}
+	return !state.lastReviewedTime.IsZero() && time.Since(state.lastReviewedTime) > reviewPropagationGracePeriod
+}
+
+// lastReviewFailed reports whether the previous review task ended in failure.
+func (s *Scanner) lastReviewFailed(filename string) bool {
+	last := s.queue.GetProcessedTask(filename)
+	return last != nil && last.Status == api.StatusFailed
+}
+
 // handlePRReview queues an automated review of a green, unreviewed pull request.
 //
 // Review instructions are collected from the pull request body and from the
@@ -323,7 +374,7 @@ func (s *Scanner) handlePRComments(ctx context.Context, pc *prContext, commentAn
 // requirement was written down. It reports whether the phase completed cleanly;
 // a false return means a sandbox probe or enqueue failed and the pull request
 // must be looked at again next cycle.
-func (s *Scanner) handlePRReview(ctx context.Context, pc *prContext, checkRuns []*githubv39.CheckRun) bool {
+func (s *Scanner) handlePRReview(ctx context.Context, pc *prContext, checkRuns []*githubv39.CheckRun, comments []*githubv39.IssueComment) bool {
 	if os.Getenv("DRY_RUN") == "true" {
 		return true
 	}
@@ -332,6 +383,19 @@ func (s *Scanner) handlePRReview(ctx context.Context, pc *prContext, checkRuns [
 	filename := fmt.Sprintf("task-pr-%d-review.yaml", num)
 
 	if s.queue.TaskExists(filename) {
+		return true
+	}
+
+	reviewCount := getReviewCount(comments, pc.lastCommitTime, s.cfg.BotUsers, s.cfg.GitHubLogin, s.cfg.AllowlistedBots, s.cfg.TriggerLabel)
+	if reviewCount >= maxReviews {
+		stopLabel := conventions.StopLabel(s.cfg.TriggerLabel)
+		if !s.cfg.DryRun {
+			s.comment(ctx, num, fmt.Sprintf("🤖 AI Factory has attempted to review this pull request %d times since the last commit or update without publishing a review. To prevent infinite loops, I am pausing automated review and attaching the `%s` label.\n\nTo request another attempt or resume automated processing, please remove the `%s` label from this pull request (and/or push a new commit or leave a comment).", maxReviews, stopLabel, stopLabel))
+			if err := s.gh.AddLabels(ctx, num, []string{stopLabel}); err != nil {
+				klog.Errorf("Failed to add stop label '%s' to PR #%d: %v", stopLabel, num, err)
+			}
+		}
+		klog.Infof("Skipping PR #%d review because it has reached the maximum retry limit (%d attempts since last update) and applying stop label '%s'.", num, maxReviews, stopLabel)
 		return true
 	}
 
@@ -392,6 +456,7 @@ func (s *Scanner) handlePRReview(ctx context.Context, pc *prContext, checkRuns [
 	}
 	fmt.Printf("Queueing review task for PR #%d (Instructions: %d)...\n", num, len(instructions))
 	state.lastReviewedSHA = pc.headSHA
+	state.lastReviewedTime = time.Now()
 	s.state.set(num, state)
 	if err := s.queue.Enqueue(filename, task); err != nil {
 		klog.Errorf("Failed to queue review task for PR #%d: %v", num, err)

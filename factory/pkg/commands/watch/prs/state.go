@@ -29,6 +29,8 @@ type prState struct {
 	lastCommentAddressedSHA string
 	// lastReviewedSHA is the commit SHA for which an automated review was last queued or completed.
 	lastReviewedSHA string
+	// lastReviewedTime is when an automated review was last queued or completed.
+	lastReviewedTime time.Time
 	// lastIteratedSHA is the commit SHA for which a rebase was last queued or completed.
 	lastIteratedSHA string
 	// lastIteratedTime is when a rebase was last queued or completed.
@@ -202,6 +204,9 @@ func foldProcessedPRTask(t *api.QueueTask, name string, state prState) prState {
 			state.lastInvestigatedSHA = t.CommitSHA
 		}
 	case strings.HasSuffix(name, "-review"):
+		if tTime.After(state.lastReviewedTime) {
+			state.lastReviewedTime = tTime
+		}
 		if t.CommitSHA != "" {
 			state.lastReviewedSHA = t.CommitSHA
 		}

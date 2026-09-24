@@ -280,6 +280,7 @@ func runReview(ctx context.Context, prURL string, publishPolicy string, instruct
 		"HOME":                       "/workspaces/.home",
 		"GITHUB_TOKEN":               string(secret.Data[constants.KeyGithubToken]),
 		"GEMINI_CLI_TRUST_WORKSPACE": "true",
+		"REPO_OWNER":                 owner,
 		"REPO_NAME":                  repo,
 		"CLONE_URL":                  cloneURL,
 		"PROMPT_FILE":                promptPath,
@@ -287,6 +288,11 @@ func runReview(ctx context.Context, prURL string, publishPolicy string, instruct
 		"GITHUB_USER_EMAIL":          githubEmail,
 		"GITHUB_USER_NAME":           githubLogin,
 		"PR_NUMBER":                  strconv.Itoa(prNum),
+		"PR_URL":                     prURL,
+		"PUBLISH_POLICY":             publishPolicy,
+	}
+	if apiURL := os.Getenv("GITHUB_API_URL"); apiURL != "" {
+		envMap["GITHUB_API_URL"] = apiURL
 	}
 	if err := applyEngineEnv(envMap, secret); err != nil {
 		return err
@@ -339,6 +345,55 @@ func sanitizedSide(s *string) *string {
 	return &v
 }
 
+// parseReviewRequest parses and sanitizes raw structured YAML output from the
+// review agent into a GitHub PullRequestReviewRequest.
+func parseReviewRequest(rawOutput string, isDraft bool) (*githubv39.PullRequestReviewRequest, string, error) {
+	reviewOutput := strings.TrimSpace(rawOutput)
+	if reviewOutput == "" {
+		return nil, "", fmt.Errorf("review output was empty")
+	}
+
+	reviewOutput = stripYAMLMarkers(reviewOutput)
+	reviewOutput = stripUntilIndicator(reviewOutput, "review:")
+
+	var agentOutput tasks.ReviewAgentOutput
+	if err := yaml.Unmarshal([]byte(reviewOutput), &agentOutput); err != nil {
+		return nil, reviewOutput, fmt.Errorf("parsing structured review output: %w", err)
+	}
+
+	var reviewEvent *string
+	if !isDraft {
+		reviewEvent = githubv39.String("COMMENT")
+	}
+
+	if agentOutput.Review != nil {
+		var comments []*githubv39.DraftReviewComment
+		for _, c := range agentOutput.Review.Comments {
+			// LLM output is not whitespace-clean: GitHub rejects the
+			// whole review over "RIGHT\n" in an enum field.
+			comments = append(comments, &githubv39.DraftReviewComment{
+				Path:      trimmedString(c.Path),
+				Position:  c.Position,
+				Body:      c.Body,
+				Line:      c.Line,
+				Side:      sanitizedSide(c.Side),
+				StartLine: c.StartLine,
+				StartSide: sanitizedSide(c.StartSide),
+			})
+		}
+		return &githubv39.PullRequestReviewRequest{
+			Body:     agentOutput.Review.Body,
+			Event:    reviewEvent,
+			Comments: comments,
+		}, reviewOutput, nil
+	}
+
+	return &githubv39.PullRequestReviewRequest{
+		Body:  githubv39.String(reviewOutput),
+		Event: reviewEvent,
+	}, reviewOutput, nil
+}
+
 func finishReview(ctx context.Context, client *envd.Client, ghClient *githubv39.Client, kubeClient *clients.KubernetesClient, pr *githubv39.PullRequest, owner, repo string, prNum int, sandboxName, taskDir, publishPolicy string) error {
 	usagereport.HarvestTask(ctx, client, taskDir, usagereport.Meta{
 		Repo:     owner + "/" + repo,
@@ -358,20 +413,6 @@ func finishReview(ctx context.Context, client *envd.Client, ghClient *githubv39.
 		return fmt.Errorf("reading review output from sandbox: %w (stderr: %s)", err, stderrBuf.String())
 	}
 
-	reviewOutput := strings.TrimSpace(stdoutBuf.String())
-	if reviewOutput == "" {
-		return fmt.Errorf("review output was empty")
-	}
-
-	reviewOutput = stripYAMLMarkers(reviewOutput)
-	reviewOutput = stripUntilIndicator(reviewOutput, "review:")
-
-	var agentOutput tasks.ReviewAgentOutput
-	if err := yaml.Unmarshal([]byte(reviewOutput), &agentOutput); err != nil {
-		return fmt.Errorf("parsing structured review output: %w", err)
-	}
-	structuredOutput := &agentOutput
-
 	shouldPublish := false
 	isDraft := false
 	switch publishPolicy {
@@ -380,6 +421,14 @@ func finishReview(ctx context.Context, client *envd.Client, ghClient *githubv39.
 	case "draft":
 		shouldPublish = true
 		isDraft = true
+	}
+
+	reviewRequest, reviewOutput, err := parseReviewRequest(stdoutBuf.String(), isDraft)
+	if err != nil {
+		return err
+	}
+
+	switch publishPolicy {
 	case "no":
 		fmt.Println("\n================= CODE REVIEW =================")
 		fmt.Println(reviewOutput)
@@ -397,48 +446,27 @@ func finishReview(ctx context.Context, client *envd.Client, ghClient *githubv39.
 		response = strings.ToLower(strings.TrimSpace(response))
 		if response == "y" || response == "yes" {
 			shouldPublish = true
+			reviewRequest.Event = githubv39.String("COMMENT")
 		} else if response == "d" || response == "draft" {
 			shouldPublish = true
 			isDraft = true
+			reviewRequest.Event = nil
 		}
 	}
 
 	if shouldPublish {
-		var reviewEvent *string
+		checkCmd := fmt.Sprintf("test -f %s/review-published", taskDir)
+		if err := client.Exec(ctx, checkCmd, "/workspaces", nil, nil, nil, nil); err == nil {
+			fmt.Println("Review was already published to the PR from inside the sandbox.")
+			return nil
+		}
+
 		if !isDraft {
-			reviewEvent = githubv39.String("COMMENT")
 			fmt.Println("Posting review to GitHub PR...")
 		} else {
 			fmt.Println("Posting review as a draft (pending) review to GitHub PR...")
 		}
 
-		var reviewRequest *githubv39.PullRequestReviewRequest
-		if structuredOutput != nil && structuredOutput.Review != nil {
-			var comments []*githubv39.DraftReviewComment
-			for _, c := range structuredOutput.Review.Comments {
-				// LLM output is not whitespace-clean: GitHub rejects the
-				// whole review over "RIGHT\n" in an enum field.
-				comments = append(comments, &githubv39.DraftReviewComment{
-					Path:      trimmedString(c.Path),
-					Position:  c.Position,
-					Body:      c.Body,
-					Line:      c.Line,
-					Side:      sanitizedSide(c.Side),
-					StartLine: c.StartLine,
-					StartSide: sanitizedSide(c.StartSide),
-				})
-			}
-			reviewRequest = &githubv39.PullRequestReviewRequest{
-				Body:     structuredOutput.Review.Body,
-				Event:    reviewEvent,
-				Comments: comments,
-			}
-		} else {
-			reviewRequest = &githubv39.PullRequestReviewRequest{
-				Body:  githubv39.String(reviewOutput),
-				Event: reviewEvent,
-			}
-		}
 		if _, _, err := ghClient.PullRequests.CreateReview(ctx, owner, repo, prNum, reviewRequest); err != nil {
 			return fmt.Errorf("failed to create review on GitHub: %w", err)
 		}
@@ -452,4 +480,89 @@ func finishReview(ctx context.Context, client *envd.Client, ghClient *githubv39.
 	}
 
 	return nil
+}
+
+type PublishReviewFlags struct {
+	PRURL   string
+	Input   string
+	Publish string
+}
+
+func NewPublishReviewCommand(ctx context.Context) *cobra.Command {
+	var flags PublishReviewFlags
+
+	cmd := &cobra.Command{
+		Use:    "publish-review",
+		Short:  "Parse and publish a structured review output file to a GitHub pull request",
+		Hidden: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if flags.PRURL == "" {
+				return fmt.Errorf("--pr-url is required")
+			}
+			if flags.Input == "" {
+				return fmt.Errorf("--input is required")
+			}
+
+			publishPolicy := strings.ToLower(strings.TrimSpace(flags.Publish))
+			if publishPolicy != "yes" && publishPolicy != "draft" {
+				return nil
+			}
+			isDraft := publishPolicy == "draft"
+
+			u, err := url.Parse(flags.PRURL)
+			if err != nil {
+				return fmt.Errorf("invalid PR URL: %w", err)
+			}
+			parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+			if len(parts) < 4 || parts[2] != "pull" {
+				return fmt.Errorf("expected URL format https://github.com/owner/repo/pull/123, got %s", flags.PRURL)
+			}
+			owner, repo := parts[0], parts[1]
+			prNum, err := strconv.Atoi(parts[3])
+			if err != nil {
+				return fmt.Errorf("invalid PR number in URL: %s", parts[3])
+			}
+
+			rawBytes, err := os.ReadFile(flags.Input)
+			if err != nil {
+				return fmt.Errorf("reading review output file %s: %w", flags.Input, err)
+			}
+
+			reviewRequest, _, err := parseReviewRequest(string(rawBytes), isDraft)
+			if err != nil {
+				return err
+			}
+
+			ghClient, err := github.NewClient(ctx)
+			if err != nil {
+				return fmt.Errorf("creating github client: %w", err)
+			}
+			if apiURL := strings.TrimSpace(os.Getenv("GITHUB_API_URL")); apiURL != "" {
+				if !strings.HasSuffix(apiURL, "/") {
+					apiURL += "/"
+				}
+				baseURL, err := url.Parse(apiURL)
+				if err != nil {
+					return fmt.Errorf("parsing GITHUB_API_URL: %w", err)
+				}
+				ghClient.BaseURL = baseURL
+			}
+
+			if _, _, err := ghClient.PullRequests.CreateReview(ctx, owner, repo, prNum, reviewRequest); err != nil {
+				return fmt.Errorf("failed to create review on GitHub: %w", err)
+			}
+			if !isDraft {
+				fmt.Println("Review successfully posted to the PR!")
+			} else {
+				fmt.Println("Draft review successfully created on the PR!")
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&flags.PRURL, "pr-url", "", "GitHub PR URL (e.g. https://github.com/owner/repo/pull/123)")
+	cmd.Flags().StringVar(&flags.Input, "input", "", "Path to the raw review output file")
+	cmd.Flags().StringVar(&flags.Publish, "publish", "yes", "Publish policy (yes|draft)")
+
+	return cmd
 }
