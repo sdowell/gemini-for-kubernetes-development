@@ -24,6 +24,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -44,6 +46,83 @@ func collectorURL() string {
 	return "http://token-usage.overseer-system.svc.cluster.local:8080"
 }
 
+func workspacesPVCName(overseerName string) string {
+	pvcName := fmt.Sprintf("workspaces-pvc-%s", overseerName)
+	if len(pvcName) > 63 {
+		pvcName = pvcName[:63]
+	}
+	return pvcName
+}
+
+// ensureWorkspacesPVC reconciles a PersistentVolumeClaim owned by the Overseer CR
+// rather than the Sandbox CR so that deleting/recreating the Sandbox during upgrades
+// preserves the /workspaces disk (task queue, chore state, logs, and git clone).
+func ensureWorkspacesPVC(ctx context.Context, c client.Client, o *overseerv1alpha1.Overseer, overseerName, namespace string) error {
+	log := log.FromContext(ctx)
+	pvcName := workspacesPVCName(overseerName)
+
+	diskSize := o.Spec.WorkspaceDiskSize
+	if diskSize == "" {
+		diskSize = "10Gi"
+	}
+	storageQty, err := resource.ParseQuantity(diskSize)
+	if err != nil {
+		storageQty = resource.MustParse("10Gi")
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{}
+	err = c.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			log.Info("Creating Overseer workspaces PVC", "name", pvcName, "namespace", namespace)
+			newPVC := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      pvcName,
+					Namespace: namespace,
+					Labels: map[string]string{
+						"overseer.gemini.google.com/overseer": o.Name,
+					},
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: storageQty,
+						},
+					},
+				},
+			}
+			if err := controllerutil.SetControllerReference(o, newPVC, c.Scheme()); err != nil {
+				return err
+			}
+			return c.Create(ctx, newPVC)
+		}
+		return err
+	}
+
+	// If an existing PVC is still controlled by the Sandbox CR (from legacy volumeClaimTemplates),
+	// transfer controller ownership to the Overseer CR so deleting the Sandbox does not GC the PVC.
+	if !metav1.IsControlledBy(pvc, o) {
+		log.Info("Adopting Overseer workspaces PVC ownership onto Overseer CR", "name", pvcName, "namespace", namespace)
+		var retainedRefs []metav1.OwnerReference
+		for _, ref := range pvc.OwnerReferences {
+			if ref.Controller != nil && *ref.Controller {
+				continue
+			}
+			retainedRefs = append(retainedRefs, ref)
+		}
+		pvc.OwnerReferences = retainedRefs
+		if err := controllerutil.SetControllerReference(o, pvc, c.Scheme()); err != nil {
+			return err
+		}
+		if err := c.Update(ctx, pvc); err != nil {
+			return fmt.Errorf("updating workspaces PVC ownerReference: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // ReconcileOverseer ensures the Overseer sandbox is running for the given Overseer.
 func ReconcileOverseer(ctx context.Context, c client.Client, o *overseerv1alpha1.Overseer) error {
 	log := log.FromContext(ctx)
@@ -55,6 +134,10 @@ func ReconcileOverseer(ctx context.Context, c client.Client, o *overseerv1alpha1
 	namespace := fmt.Sprintf("overseer-%s", o.Name)
 	if len(namespace) > 63 {
 		namespace = namespace[:63]
+	}
+
+	if err := ensureWorkspacesPVC(ctx, c, o, overseerName, namespace); err != nil {
+		return err
 	}
 
 	// Define the sandbox object
@@ -333,13 +416,18 @@ func newOverseerSandboxFromOverseer(o *overseerv1alpha1.Overseer, name, namespac
 		ephemeralStorage = "10Gi"
 	}
 
-	diskSize := o.Spec.WorkspaceDiskSize
-	if diskSize == "" {
-		diskSize = "10Gi"
-	}
+	pvcName := workspacesPVCName(name)
 
 	podSpec := map[string]interface{}{
 		"serviceAccountName": "overseer",
+		"volumes": []interface{}{
+			map[string]interface{}{
+				"name": "workspaces-pvc",
+				"persistentVolumeClaim": map[string]interface{}{
+					"claimName": pvcName,
+				},
+			},
+		},
 		"containers": []interface{}{
 			map[string]interface{}{
 				"name":    "overseer",
@@ -460,21 +548,6 @@ func newOverseerSandboxFromOverseer(o *overseerv1alpha1.Overseer, name, namespac
 						},
 					},
 					"spec": podSpec,
-				},
-				"volumeClaimTemplates": []interface{}{
-					map[string]interface{}{
-						"metadata": map[string]interface{}{
-							"name": "workspaces-pvc",
-						},
-						"spec": map[string]interface{}{
-							"accessModes": []interface{}{"ReadWriteOnce"},
-							"resources": map[string]interface{}{
-								"requests": map[string]interface{}{
-									"storage": diskSize,
-								},
-							},
-						},
-					},
 				},
 			},
 		},

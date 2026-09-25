@@ -67,7 +67,9 @@ while true; do
 done
 
 echo ""
-echo "[Step 3] Cleaning up DO NOT PROCESS drain flags before recreation..."
+echo "[Step 3] Gracefully stopping watch loop to flush queue & chore state, then cleaning up DO NOT PROCESS drain flags..."
+kubectl exec -n "$NAMESPACE" "$POD_NAME" -- pkill -TERM -f "factory watch" 2>/dev/null || true
+sleep 5
 kubectl exec -n "$NAMESPACE" "$POD_NAME" -- rm -f /workspaces/.do_not_process /workspaces/do_not_process /workspaces/.drain /workspaces/drain /workspaces/queues/.do_not_process /workspaces/queues/do_not_process /workspaces/queues/.drain /workspaces/queues/drain || true
 
 echo ""

@@ -222,6 +222,32 @@ echo "Ensuring fork is configured..."
 gh repo fork --remote || true
 
 
+function syncQueueState {
+    local state_branch="${TRIGGER_LABEL_VAL:-overseer}"
+    if [ -d "/workspaces/$REPO_NAME/overseer/queues" ]; then
+        (
+            cd "/workspaces/$REPO_NAME" || exit 0
+            git add ./overseer/queues || true
+            if [ -f "./overseer/queues/journal.jsonl" ]; then
+                git add -f ./overseer/queues/journal.jsonl || true
+            fi
+            if [ -f "./overseer/queues/chores_state.json" ]; then
+                git add -f ./overseer/queues/chores_state.json || true
+            fi
+
+            if ! git diff --cached --quiet; then
+                echo "$(date): Committing and pushing queue updates to branch $state_branch..."
+                git commit -m "chore(watch): sync queue state at $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
+                git push origin "HEAD:refs/heads/$state_branch" --force || true
+            else
+                echo "$(date): No queue changes to push."
+            fi
+        )
+    fi
+}
+
+trap 'echo "$(date): Caught termination signal, syncing queue state..."; syncQueueState' SIGTERM SIGINT EXIT
+
 function runGeminiOrchestrator {
     # Run Gemini LLM (Non-deterministic Scanner/Orchestrator)
     constructPrompt
@@ -248,6 +274,12 @@ function runWatchCycle {
     # 2. Get default branch (e.g. main or master)
     DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || echo "main")
     
+    # Preserve any existing local ./overseer/queues state before git reset/clean
+    rm -rf /workspaces/.queues-backup
+    if [ -d "./overseer/queues" ]; then
+        cp -a ./overseer/queues /workspaces/.queues-backup
+    fi
+
     # 3. Update default branch
     REMOTE_MAIN="origin"
     if git remote | grep -q "^upstream$"; then
@@ -255,24 +287,46 @@ function runWatchCycle {
     fi
     git reset --hard HEAD || true
     git clean -fd || true
-    git checkout $DEFAULT_BRANCH -- || git checkout -b $DEFAULT_BRANCH
-    git fetch $REMOTE_MAIN
-    git reset --hard $REMOTE_MAIN/$DEFAULT_BRANCH
+    git checkout "$DEFAULT_BRANCH" -- || git checkout -b "$DEFAULT_BRANCH"
+    git fetch "$REMOTE_MAIN"
+    git reset --hard "$REMOTE_MAIN/$DEFAULT_BRANCH"
     
     # 4. Switch to state tracking branch (named after TRIGGER_LABEL_VAL) and rebase onto default branch
     STATE_BRANCH=${TRIGGER_LABEL_VAL:-overseer}
-    git checkout $STATE_BRANCH -- || git checkout -b $STATE_BRANCH
-    git rebase $DEFAULT_BRANCH || {
+    git fetch origin "$STATE_BRANCH" || true
+    if git show-ref --verify --quiet "refs/heads/$STATE_BRANCH"; then
+        git checkout "$STATE_BRANCH" --
+    elif git show-ref --verify --quiet "refs/remotes/origin/$STATE_BRANCH"; then
+        echo "$(date): Restoring state branch $STATE_BRANCH from origin/$STATE_BRANCH..."
+        git checkout -b "$STATE_BRANCH" "origin/$STATE_BRANCH"
+    else
+        echo "$(date): Creating new state branch $STATE_BRANCH from $DEFAULT_BRANCH..."
+        git checkout -b "$STATE_BRANCH" "$DEFAULT_BRANCH"
+    fi
+
+    # If this was a fresh clone and origin/$STATE_BRANCH had ./overseer/queues, back it up before rebasing
+    if [ ! -d "/workspaces/.queues-backup" ] && [ -d "./overseer/queues" ]; then
+        cp -a ./overseer/queues /workspaces/.queues-backup
+    fi
+
+    git rebase "$DEFAULT_BRANCH" || {
         echo "$(date): Rebase failed. Resetting state branch $STATE_BRANCH to $DEFAULT_BRANCH..."
         git rebase --abort || true
-        git reset --hard $DEFAULT_BRANCH
+        git reset --hard "$DEFAULT_BRANCH"
     }
+
+    if [ -d "/workspaces/.queues-backup" ]; then
+        rm -rf ./overseer/queues
+        mkdir -p ./overseer
+        mv /workspaces/.queues-backup ./overseer/queues
+    fi
     
     # 5. Run Watch Daemon for POLL_INTERVAL duration (default 300s/5m)
     TIMEOUT_DURATION=${POLL_INTERVAL:-300s}
     if [[ "$TIMEOUT_DURATION" =~ ^[0-9]+$ ]]; then
         TIMEOUT_DURATION="${TIMEOUT_DURATION}s"
     fi
+    WATCH_EXIT=0
     factory watch \
         --mode all \
         --watch-timeout "${TIMEOUT_DURATION}" \
@@ -280,10 +334,10 @@ function runWatchCycle {
         --repo "$REPO_PATH" \
         --sandbox-eviction-age "${SANDBOX_EVICTION_AGE:-14d}" \
         --sandbox-idle-timeout "${SANDBOX_IDLE_TIMEOUT:-1h}" \
-        --task-timeout "${TASK_TIMEOUT:-24h}"
+        --task-timeout "${TASK_TIMEOUT:-24h}" || WATCH_EXIT=$?
         
     # 6. Run Gemini LLM (Non-deterministic Scanner/Orchestrator)
-    if [ "${ALLOW_GEMINI_ORCHESTRATION}" = "true" ]; then
+    if [ "$WATCH_EXIT" -eq 0 ] && [ "${ALLOW_GEMINI_ORCHESTRATION}" = "true" ]; then
         if [ ! -f "/workspaces/.do_not_process" ] && [ ! -f "/workspaces/do_not_process" ] && [ ! -f "/workspaces/.drain" ] && [ ! -f "/workspaces/drain" ] && [ "$DO_NOT_PROCESS" != "true" ] && [ "$FACTORY_DO_NOT_PROCESS" != "true" ]; then
             runGeminiOrchestrator
         else
@@ -292,23 +346,9 @@ function runWatchCycle {
     fi
 
     # 7. Push queue and state changes back to fork/origin
-    if [ -d "./overseer/queues" ]; then
-        git add ./overseer/queues
-        if [ -f "./overseer/queues/journal.jsonl" ]; then
-            git add ./overseer/queues/journal.jsonl
-        fi
-        if [ -f "./overseer/queues/chores_state.json" ]; then
-            git add ./overseer/queues/chores_state.json
-        fi
-        
-        if ! git diff --cached --quiet; then
-            echo "$(date): Committing and pushing queue updates to branch $STATE_BRANCH..."
-            git commit -m "chore(watch): sync queue state at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            git push origin $STATE_BRANCH --force
-        else
-            echo "$(date): No queue changes to push."
-        fi
-    fi
+    syncQueueState
+
+    return $WATCH_EXIT
 }
 
 # Loop

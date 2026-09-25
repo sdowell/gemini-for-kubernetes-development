@@ -24,7 +24,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -202,3 +204,106 @@ func TestOverseerReconciler_ObservedGeneration(t *testing.T) {
 		}
 	})
 }
+
+func TestOverseerReconciler_WorkspacesPVC(t *testing.T) {
+	scheme := setupTestScheme()
+	ctx := context.Background()
+
+	isController := true
+	overseerObj := &overseerv1alpha1.Overseer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "kcc",
+			UID:        "overseer-uid-123",
+			Generation: 1,
+		},
+		Spec: overseerv1alpha1.OverseerSpec{
+			RepoURL:                "https://github.com/test/repo",
+			GeminiAPIKeySecretName: "my-gemini-key",
+			WorkspaceDiskSize:      "40Gi",
+		},
+	}
+
+	geminiSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-gemini-key",
+			Namespace: "overseer-system",
+		},
+		Data: map[string][]byte{
+			"GEMINI_API_KEY": []byte("test-key"),
+		},
+	}
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "github-portal-ca",
+			Namespace: "overseer-system",
+		},
+		Data: map[string][]byte{
+			"ca.crt": []byte("test-ca"),
+		},
+	}
+
+	// Simulate a legacy PVC previously owned by the Sandbox CR (from volumeClaimTemplates)
+	legacyPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "workspaces-pvc-overseer-kcc",
+			Namespace: "overseer-kcc",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "agents.x-k8s.io/v1alpha1",
+					Kind:       "Sandbox",
+					Name:       "overseer-kcc",
+					UID:        "sandbox-uid-456",
+					Controller: &isController,
+				},
+			},
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&overseerv1alpha1.Overseer{}).
+		WithObjects(overseerObj, geminiSecret, caSecret, legacyPVC).
+		Build()
+
+	r := &OverseerReconciler{
+		Client: k8sClient,
+		Scheme: scheme,
+	}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "kcc"},
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var pvc corev1.PersistentVolumeClaim
+	if err := k8sClient.Get(ctx, types.NamespacedName{
+		Name:      "workspaces-pvc-overseer-kcc",
+		Namespace: "overseer-kcc",
+	}, &pvc); err != nil {
+		t.Fatalf("expected workspaces PVC to exist: %v", err)
+	}
+
+	if !metav1.IsControlledBy(&pvc, overseerObj) {
+		t.Errorf("expected PVC to be controlled by Overseer CR, got ownerReferences: %+v", pvc.OwnerReferences)
+	}
+
+	sandbox := &unstructured.Unstructured{}
+	sandbox.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "agents.x-k8s.io",
+		Version: "v1alpha1",
+		Kind:    "Sandbox",
+	})
+	if err := k8sClient.Get(ctx, types.NamespacedName{
+		Name:      "overseer-kcc",
+		Namespace: "overseer-kcc",
+	}, sandbox); err != nil {
+		t.Fatalf("expected Sandbox to exist: %v", err)
+	}
+
+	if _, found, _ := unstructured.NestedSlice(sandbox.Object, "spec", "volumeClaimTemplates"); found {
+		t.Errorf("expected Sandbox spec not to have volumeClaimTemplates")
+	}
+}
+
