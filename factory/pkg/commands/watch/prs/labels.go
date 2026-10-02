@@ -2,6 +2,7 @@ package prs
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -241,9 +242,21 @@ func (s *Scanner) isHumanUser(u *githubv39.User) bool {
 	return true
 }
 
-// getMissingHumanAssigneesForPR returns the human assignees on the referenced
-// parent issues that are not yet assigned to the pull request.
-func (s *Scanner) getMissingHumanAssigneesForPR(prAssignees []*githubv39.User, refIssues []*githubv39.Issue) []string {
+// getMissingHumanAssigneesForPR returns the humans on the referenced parent
+// issues that are not yet assigned to the pull request: each issue's human
+// assignees or, for an issue the pull request closes that has no human
+// assignee, its creator when that creator is a human. closing holds the
+// numbers of the issues the pull request closes (see refIssues.closing).
+//
+// The creator is the fallback because they are the person who asked for the
+// change, and so the natural owner of reviewing it when nobody has been
+// assigned the issue. That only holds for an issue the pull request closes: a
+// pull request that merely mentions an issue ("related to #45") is not the
+// change its creator asked for. An issue that does have a human assignee has
+// an owner already, and the creator is left off. An issue opened by a bot - an
+// automated report, a filing from the watcher itself - has no such owner,
+// which is why the creator only counts when isHumanUser says so.
+func (s *Scanner) getMissingHumanAssigneesForPR(prAssignees []*githubv39.User, refIssues []*githubv39.Issue, closing map[int]bool) []string {
 	existing := make(map[string]bool, len(prAssignees))
 	for _, u := range prAssignees {
 		if login := u.GetLogin(); login != "" {
@@ -253,21 +266,75 @@ func (s *Scanner) getMissingHumanAssigneesForPR(prAssignees []*githubv39.User, r
 
 	var missing []string
 	seen := make(map[string]bool)
+	add := func(u *githubv39.User) {
+		login := u.GetLogin()
+		key := strings.ToLower(login)
+		if !existing[key] && !seen[key] {
+			seen[key] = true
+			missing = append(missing, login)
+		}
+	}
 	for _, refIssue := range refIssues {
 		if refIssue == nil || refIssue.PullRequestLinks != nil {
 			continue
 		}
+		hasHumanAssignee := false
 		for _, u := range refIssue.Assignees {
-			if !s.isHumanUser(u) {
-				continue
+			if s.isHumanUser(u) {
+				hasHumanAssignee = true
+				add(u)
 			}
-			login := u.GetLogin()
-			key := strings.ToLower(login)
-			if !existing[key] && !seen[key] {
-				seen[key] = true
-				missing = append(missing, login)
-			}
+		}
+		// Whether the issue has a human assignee is judged on the issue,
+		// not on what is still missing from the pull request: an assignee
+		// already carried over still means the issue has an owner.
+		if !hasHumanAssignee && closing[refIssue.GetNumber()] && s.isHumanUser(refIssue.User) {
+			add(refIssue.User)
 		}
 	}
 	return missing
+}
+
+// inheritHumanAssignees assigns to the pull request the humans from its parent
+// issues (see getMissingHumanAssigneesForPR) that it does not already carry.
+// reason says why in the log lines. It reports whether the pull request is now
+// in step with its parent issues: false means nothing could be checked or the
+// assignment failed, and is worth retrying.
+//
+// It is idempotent: when nothing is missing it makes no API calls, which is
+// what lets it run on every evaluation of a pull request that is ready for a
+// human or stopped, rather than only on the transition into that state. A
+// human assigned to the parent issue later therefore still reaches the pull
+// request.
+func (s *Scanner) inheritHumanAssignees(ctx context.Context, prIssue *githubv39.Issue, refs *refIssues, reason string) bool {
+	if refs == nil || prIssue == nil || !s.gh.Ready() {
+		return false
+	}
+	num := prIssue.GetNumber()
+	humanAssignees := s.getMissingHumanAssigneesForPR(prIssue.Assignees, refs.all(ctx), refs.closing())
+	if len(humanAssignees) == 0 {
+		return true
+	}
+	if s.cfg.DryRun {
+		fmt.Printf("[DRYRUN] Would assign inherited human assignees %v to PR #%d (%s)\n", humanAssignees, num, reason)
+		return true
+	}
+	klog.Infof("Assigning inherited human assignees %v to PR #%d (%s)", humanAssignees, num, reason)
+	if err := s.gh.AddAssignees(ctx, num, humanAssignees); err != nil {
+		klog.Errorf("Failed to assign inherited human assignees %v to PR #%d: %v", humanAssignees, num, err)
+		return false
+	}
+	return true
+}
+
+// isBotPoolUser reports whether login is one of the bot accounts the watcher
+// works through. Only pull requests they authored are the watcher's to act
+// on: it cannot push to a fork it does not own.
+func (s *Scanner) isBotPoolUser(login string) bool {
+	for _, bot := range s.cfg.BotUsers {
+		if strings.EqualFold(login, bot) {
+			return true
+		}
+	}
+	return false
 }

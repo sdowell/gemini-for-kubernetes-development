@@ -68,3 +68,22 @@ func (r *refIssues) all(ctx context.Context) []*githubv39.Issue {
 	}
 	return r.resolved
 }
+
+// closing returns the numbers of the issues the pull request actually closes
+// (see strictClosingIssues). all resolves more than that - any issue merely
+// mentioned with #N - and callers intersect the two, so an issue counts as
+// closed only if all resolved it too. In practice that leaves out a closing
+// reference given only as an issue URL, which all does not pick up.
+//
+// The distinction matters wherever a mention would be too weak a signal, such
+// as deciding that the person who filed an issue should own the pull request.
+func (r *refIssues) closing() map[int]bool {
+	if r == nil || r.pr == nil {
+		return nil
+	}
+	var owner, repo string
+	if r.gh != nil {
+		owner, repo = r.gh.Owner(), r.gh.Repo()
+	}
+	return strictClosingIssues(r.pr, owner, repo)
+}

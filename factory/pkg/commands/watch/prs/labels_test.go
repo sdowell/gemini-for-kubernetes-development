@@ -566,7 +566,7 @@ func TestGetMissingHumanAssigneesForPR(t *testing.T) {
 		},
 	}
 
-	got := s.getMissingHumanAssigneesForPR(prAssignees, refIssues)
+	got := s.getMissingHumanAssigneesForPR(prAssignees, refIssues, nil)
 	want := []string{"bob", "carol"}
 
 	if len(got) != len(want) {
@@ -576,5 +576,98 @@ func TestGetMissingHumanAssigneesForPR(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("getMissingHumanAssigneesForPR()[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestGetMissingHumanAssigneesForPR_CreatorFallback(t *testing.T) {
+	s := &Scanner{
+		cfg: Config{
+			BotUsers:    []string{"ada-coder", "overseer-watcher"},
+			GitHubLogin: "overseer-watcher",
+		},
+	}
+	user := func(login string) *githubv39.User { return &githubv39.User{Login: stringPtr(login)} }
+	issue := func(num int, creator *githubv39.User, assignees ...*githubv39.User) *githubv39.Issue {
+		return &githubv39.Issue{Number: &num, User: creator, Assignees: assignees}
+	}
+
+	tests := []struct {
+		name        string
+		prAssignees []*githubv39.User
+		refIssues   []*githubv39.Issue
+		closing     map[int]bool
+		want        []string
+	}{
+		{
+			name:      "human creator of an unassigned closed issue is the fallback",
+			refIssues: []*githubv39.Issue{issue(1, user("dave"))},
+			closing:   map[int]bool{1: true},
+			want:      []string{"dave"},
+		},
+		{
+			name:      "creator of an issue the PR only mentions is not assigned",
+			refIssues: []*githubv39.Issue{issue(1, user("dave"))},
+			closing:   map[int]bool{2: true},
+			want:      nil,
+		},
+		{
+			name:      "assignees of an issue the PR only mentions are still inherited",
+			refIssues: []*githubv39.Issue{issue(1, user("dave"), user("bob"))},
+			want:      []string{"bob"},
+		},
+		{
+			name:      "human creator is skipped when the issue has a human assignee",
+			refIssues: []*githubv39.Issue{issue(1, user("dave"), user("bob"))},
+			closing:   map[int]bool{1: true},
+			want:      []string{"bob"},
+		},
+		{
+			name:        "human assignee already on the PR still suppresses the creator",
+			prAssignees: []*githubv39.User{user("bob")},
+			refIssues:   []*githubv39.Issue{issue(1, user("dave"), user("bob"))},
+			closing:     map[int]bool{1: true},
+			want:        nil,
+		},
+		{
+			name:      "bot-only assignees do not suppress the human creator",
+			refIssues: []*githubv39.Issue{issue(1, user("dave"), user("ada-coder"))},
+			closing:   map[int]bool{1: true},
+			want:      []string{"dave"},
+		},
+		{
+			name: "bot creator is never assigned",
+			refIssues: []*githubv39.Issue{
+				issue(1, user("overseer-watcher")),
+				issue(2, &githubv39.User{Login: stringPtr("dependabot[bot]"), Type: stringPtr("Bot")}),
+			},
+			closing: map[int]bool{1: true, 2: true},
+			want:    nil,
+		},
+		{
+			name:        "creator already on the PR is not repeated",
+			prAssignees: []*githubv39.User{user("Dave")},
+			refIssues:   []*githubv39.Issue{issue(1, user("dave"))},
+			closing:     map[int]bool{1: true},
+			want:        nil,
+		},
+		{
+			name: "fallback is decided per issue",
+			refIssues: []*githubv39.Issue{
+				issue(1, user("dave"), user("bob")),
+				issue(2, user("erin")),
+				issue(3, user("frank")),
+			},
+			closing: map[int]bool{1: true, 2: true},
+			want:    []string{"bob", "erin"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := s.getMissingHumanAssigneesForPR(tc.prAssignees, tc.refIssues, tc.closing)
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("getMissingHumanAssigneesForPR() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

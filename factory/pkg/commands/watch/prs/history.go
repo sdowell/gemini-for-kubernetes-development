@@ -93,7 +93,11 @@ func (s *Scanner) fetchHistory(ctx context.Context, num int) (*prHistory, error)
 // on a change that will never merge. The stop label is applied rather than the
 // pull request being silently dropped, so that the pause is visible and a human
 // can undo it by removing the label.
-func (s *Scanner) pauseIfInactive(ctx context.Context, pr *githubv39.PullRequest, prIssue *githubv39.Issue, history *prHistory, headSHA string) bool {
+//
+// Pausing hands the pull request back to people, so the humans on its parent
+// issues are assigned to it at the same time, as they are when it becomes
+// ready for a human.
+func (s *Scanner) pauseIfInactive(ctx context.Context, pr *githubv39.PullRequest, prIssue *githubv39.Issue, refs *refIssues, history *prHistory, headSHA string) bool {
 	if s.cfg.InactivityTimeout <= 0 {
 		return false
 	}
@@ -106,6 +110,7 @@ func (s *Scanner) pauseIfInactive(ctx context.Context, pr *githubv39.PullRequest
 	stopLabel := conventions.StopLabel(s.cfg.TriggerLabel)
 	if s.cfg.DryRun {
 		fmt.Printf("[DRYRUN] Would pause automated processing on PR #%d and apply label '%s' due to inactivity since %v\n", num, stopLabel, lastActivity)
+		s.inheritHumanAssignees(ctx, prIssue, refs, "processing paused")
 		return true
 	}
 
@@ -119,6 +124,9 @@ func (s *Scanner) pauseIfInactive(ctx context.Context, pr *githubv39.PullRequest
 		klog.Errorf("Failed to add stop label '%s' to PR #%d: %v", stopLabel, num, err)
 	}
 	_ = s.queue.RemovePendingTasksForNumber(num)
+	if s.inheritHumanAssignees(ctx, prIssue, refs, "processing paused") {
+		s.markStoppedAssigneesSynced(prIssue)
+	}
 	return true
 }
 

@@ -56,7 +56,7 @@
   3. failing CI → `investigate`
   4. green and labelled for review → `review`
 
-  A PR that passes review is labelled `<trigger>/ready-for-human` and handed to the human assignees. `--pr-inactivity-timeout` pauses PRs that no human has touched for that long.
+  A PR that passes review is labelled `<trigger>/ready-for-human` and handed to the human assignees of its parent issues, or to the human who opened an unassigned issue the PR closes. Paused and stopped PRs are handed over the same way. `--pr-inactivity-timeout` pauses PRs that no human has touched for that long.
 - **Chores.** Agent definitions under `.agents/` that have a cron `schedule` run as `agent-chore` tasks (`--chores-mode`).
 - **Filesystem queue.**
   - Work is queued as task files that move `incoming/ → processing/ → processed/` under `--queue-dir`. A `journal.jsonl` sits alongside.

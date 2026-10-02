@@ -13,7 +13,6 @@ package prs
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	githubv39 "github.com/google/go-github/v39/github"
@@ -361,6 +360,7 @@ func (s *Scanner) evaluate(ctx context.Context, prIssue *githubv39.Issue) {
 	if conventions.HasStopLabel(prIssue.Labels, s.cfg.TriggerLabel) {
 		klog.Infof("Skipping PR #%d because it has the stop label ('overseer/stop' or '%s/stop')", num, s.cfg.TriggerLabel)
 		_ = s.queue.RemovePendingTasksForNumber(num)
+		s.inheritAssigneesForStoppedPR(ctx, prIssue)
 		return
 	}
 	pr, err := s.gh.GetPullRequest(ctx, num)
@@ -383,14 +383,7 @@ func (s *Scanner) evaluate(ctx context.Context, prIssue *githubv39.Issue) {
 	// Only pull requests created by a bot in the pool can be worked on: we do
 	// not have permission to push to an external fork.
 	author := pr.GetUser().GetLogin()
-	isBotPR := false
-	for _, bot := range s.cfg.BotUsers {
-		if strings.EqualFold(author, bot) {
-			isBotPR = true
-			break
-		}
-	}
-	if !isBotPR {
+	if !s.isBotPoolUser(author) {
 		klog.Infof("Skipping PR #%d because it was created by %s (not in our bot pool). We do not have permission to push to external forks.", num, author)
 		return
 	}
@@ -407,6 +400,9 @@ func (s *Scanner) evaluate(ctx context.Context, prIssue *githubv39.Issue) {
 	if conventions.HasStopLabel(prIssue.Labels, s.cfg.TriggerLabel) {
 		klog.Infof("Skipping PR #%d after label sync because it has the stop label ('overseer/stop' or '%s/stop')", num, s.cfg.TriggerLabel)
 		_ = s.queue.RemovePendingTasksForNumber(num)
+		if s.inheritHumanAssignees(ctx, prIssue, refs, "processing stopped") {
+			s.markStoppedAssigneesSynced(prIssue)
+		}
 		return
 	}
 
@@ -430,7 +426,7 @@ func (s *Scanner) evaluate(ctx context.Context, prIssue *githubv39.Issue) {
 
 	state := s.state.get(num)
 
-	if s.pauseIfInactive(ctx, pr, prIssue, history, headSHA) {
+	if s.pauseIfInactive(ctx, pr, prIssue, refs, history, headSHA) {
 		return
 	}
 
@@ -533,10 +529,76 @@ func (s *Scanner) recordEvaluation(prIssue *githubv39.Issue, pr *githubv39.PullR
 	s.state.set(num, state)
 }
 
+// inheritAssigneesForStoppedPR assigns the humans from a stopped pull
+// request's parent issues to it, as inheritHumanAssignees does for one that is
+// ready for a human. Stopping hands the pull request back to people, and they
+// should be the ones assigned to it.
+//
+// The stop check runs before the pull request is fetched, and a stopped pull
+// request still assigned to a bot is looked at on every fast pass, so syncing
+// unconditionally would add a fetch per stopped pull request per pass. The
+// sync is therefore repeated only once the pull request has been updated since
+// the last one, or once a sweep interval has gone by - the latter is what
+// picks up a human assigned to the parent issue later, which does not move the
+// pull request's updated_at.
+//
+// Like the rest of evaluation it only applies to pull requests authored by the
+// bot pool.
+func (s *Scanner) inheritAssigneesForStoppedPR(ctx context.Context, prIssue *githubv39.Issue) {
+	if !s.gh.Ready() || !s.isBotPoolUser(prIssue.GetUser().GetLogin()) {
+		return
+	}
+
+	num := prIssue.GetNumber()
+	if s.stoppedAssigneesInSync(prIssue) {
+		return
+	}
+
+	pr, err := s.gh.GetPullRequest(ctx, num)
+	if err != nil {
+		klog.Errorf("Failed to fetch full PR #%d to inherit assignees: %v", num, err)
+		return
+	}
+	if s.inheritHumanAssignees(ctx, prIssue, newRefIssues(s.gh, pr), "processing stopped") {
+		s.markStoppedAssigneesSynced(prIssue)
+	}
+}
+
+// stoppedAssigneesInSync reports whether a stopped pull request's assignees
+// were synced recently enough, and the pull request left alone since, that
+// syncing them again can be skipped.
+//
+// updated_at is compared against when the sync happened rather than against
+// the updated_at seen at the time. The watcher's own writes - the stop label
+// and comment from a pause, the assignees just added - all move updated_at,
+// and comparing against the stale copy would treat them as a change and spend
+// a fetch confirming that nothing is missing.
+func (s *Scanner) stoppedAssigneesInSync(prIssue *githubv39.Issue) bool {
+	syncedAt := s.state.get(prIssue.GetNumber()).stoppedAssigneeSyncTime
+	if syncedAt.IsZero() {
+		return false
+	}
+	return !prIssue.GetUpdatedAt().After(syncedAt) && time.Since(syncedAt) < s.cfg.SweepInterval
+}
+
+// markStoppedAssigneesSynced records that a stopped pull request's assignees
+// have just been synced with its parent issues (see stoppedAssigneesInSync).
+func (s *Scanner) markStoppedAssigneesSynced(prIssue *githubv39.Issue) {
+	num := prIssue.GetNumber()
+	state := s.state.get(num)
+	state.stoppedAssigneeSyncTime = time.Now()
+	s.state.set(num, state)
+}
+
 // reconcileReadiness decides whether a pull request is ready for a human and
 // applies the consequences: adding the ready-for-human label, removing any
 // review label, inheriting human assignees from the parent issues, and
 // unassigning the bot that was working on it.
+//
+// The review label removal and the assignee inheritance are repeated on every
+// later evaluation that still finds the pull request ready, not only on the
+// transition. Once the bot is unassigned the fast pass no longer lists the pull
+// request, so in practice that is once per sweep.
 //
 // Every gate has to hold, including that no task is queued or running for the
 // pull request. Reading that from the in-memory queue rather than from disk is
@@ -580,6 +642,10 @@ func (s *Scanner) reconcileReadiness(
 		// trigger label), and returning here left it on the PR
 		// forever, re-arming bot reviews on work a human already owns.
 		s.removeReviewLabels(ctx, pc, num)
+		// Likewise keep the assignees in step with the parent issues on
+		// every pass, so a human assigned to an issue after the PR went
+		// ready still reaches it. Idempotent once they are all there.
+		s.inheritHumanAssignees(ctx, pc.prIssue, pc.refIssues, "ready for human review")
 		return
 	}
 	readyLabel := readyForHumanLabel(s.cfg.TriggerLabel)
@@ -594,18 +660,7 @@ func (s *Scanner) reconcileReadiness(
 	}
 	s.removeReviewLabels(ctx, pc, num)
 	// Inherit human assignees from parent issue
-	if pc.refIssues != nil {
-		if humanAssignees := s.getMissingHumanAssigneesForPR(pc.prIssue.Assignees, pc.refIssues.all(ctx)); len(humanAssignees) > 0 {
-			if s.cfg.DryRun {
-				fmt.Printf("[DRYRUN] Would assign inherited human assignees %v to PR #%d (ready for human review)\n", humanAssignees, num)
-			} else {
-				klog.Infof("Assigning inherited human assignees %v to PR #%d (ready for human review)", humanAssignees, num)
-				if err := s.gh.AddAssignees(ctx, num, humanAssignees); err != nil {
-					klog.Errorf("Failed to assign inherited human assignees %v to PR #%d: %v", humanAssignees, num, err)
-				}
-			}
-		}
-	}
+	s.inheritHumanAssignees(ctx, pc.prIssue, pc.refIssues, "ready for human review")
 	// Remove bot assignee
 	if assignedBot != "" {
 		if s.cfg.DryRun {

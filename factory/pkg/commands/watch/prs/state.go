@@ -55,6 +55,12 @@ type prState struct {
 	// pull request ready for a human, and it is invisible in updated_at when
 	// the task finished without pushing anything.
 	lastEvaluationHadTask bool
+
+	// stoppedAssigneeSyncTime is when assignees were last inherited for the
+	// pull request while it carried the stop label. It gates that sync (see
+	// Scanner.stoppedAssigneesInSync), which costs a pull request fetch the
+	// stop path otherwise avoids.
+	stoppedAssigneeSyncTime time.Time
 }
 
 // stateStore holds the per-pull-request gating state.
