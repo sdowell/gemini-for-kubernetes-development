@@ -21,7 +21,12 @@ Below are the existing comments on the PR since the last commit. Look for "### I
 {{ .Body }}
 {{ end }}
 
-## Instructions
+{{ if .Instruction }}## User Request
+{{ .Instruction }}
+
+Follow this request first, before the instructions below.
+
+{{ end }}## Instructions
 
 1. **Check for Repeated Failures**:
    - Count how many "### Investigating" comments have already been posted (only since the last commit).

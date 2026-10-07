@@ -230,6 +230,7 @@ func runInvestigate(ctx context.Context, prURL, prompt string, continueSession b
 		},
 		FailedRuns:    failedRuns,
 		IssueComments: prComments,
+		Instruction:   prompt,
 		Models:        tasks.DefaultModels,
 		TriggerLabel:  triggerLabel,
 		Disclose:      rootFlags.Disclose,
