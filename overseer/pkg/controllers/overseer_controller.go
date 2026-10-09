@@ -48,7 +48,6 @@ type OverseerReconciler struct {
 //+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=pods;events,verbs=get;list
 //+kubebuilder:rbac:groups="",resources=pods/portforward,verbs=create
@@ -173,31 +172,6 @@ func (r *OverseerReconciler) ensureOverseerRBAC(ctx context.Context, o *overseer
 		}
 	}
 
-	// Add to ClusterRoleBinding "overseer-binding"
-	crb := &rbacv1.ClusterRoleBinding{}
-	if err := r.Get(ctx, types.NamespacedName{Name: "overseer-binding"}, crb); err == nil {
-		found := false
-		for _, s := range crb.Subjects {
-			if s.Kind == "ServiceAccount" && s.Name == "overseer" && s.Namespace == namespace {
-				found = true
-				break
-			}
-		}
-		if !found {
-			log.Info("Adding ServiceAccount to overseer-binding ClusterRoleBinding", "namespace", namespace)
-			crb.Subjects = append(crb.Subjects, rbacv1.Subject{
-				Kind:      "ServiceAccount",
-				Name:      "overseer",
-				Namespace: namespace,
-			})
-			if err := r.Update(ctx, crb); err != nil {
-				return err
-			}
-		}
-	} else if !errors.IsNotFound(err) {
-		return err
-	}
-
 	// --- Overseer Sandbox ---
 	saSandbox := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
@@ -244,31 +218,6 @@ func (r *OverseerReconciler) ensureOverseerRBAC(ctx context.Context, o *overseer
 		} else {
 			return err
 		}
-	}
-
-	// Add to ClusterRoleBinding "overseer-sandbox"
-	crbSandbox := &rbacv1.ClusterRoleBinding{}
-	if err := r.Get(ctx, types.NamespacedName{Name: "overseer-sandbox"}, crbSandbox); err == nil {
-		found := false
-		for _, s := range crbSandbox.Subjects {
-			if s.Kind == "ServiceAccount" && s.Name == "overseer-sandbox" && s.Namespace == namespace {
-				found = true
-				break
-			}
-		}
-		if !found {
-			log.Info("Adding ServiceAccount to overseer-sandbox ClusterRoleBinding", "namespace", namespace)
-			crbSandbox.Subjects = append(crbSandbox.Subjects, rbacv1.Subject{
-				Kind:      "ServiceAccount",
-				Name:      "overseer-sandbox",
-				Namespace: namespace,
-			})
-			if err := r.Update(ctx, crbSandbox); err != nil {
-				return err
-			}
-		}
-	} else if !errors.IsNotFound(err) {
-		return err
 	}
 
 	return nil

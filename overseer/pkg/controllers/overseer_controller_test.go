@@ -201,4 +201,81 @@ func TestOverseerReconciler_ObservedGeneration(t *testing.T) {
 			t.Fatalf("expected empty result, got: %v", res)
 		}
 	})
+
+	t.Run("Reconcile binds ServiceAccounts via namespace RoleBindings without modifying ClusterRoleBindings", func(t *testing.T) {
+		overseer := &overseerv1alpha1.Overseer{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "tenant-isolation",
+				Generation: 1,
+			},
+			Spec: overseerv1alpha1.OverseerSpec{
+				RepoURL:                "https://github.com/test/repo",
+				GeminiAPIKeySecretName: "my-gemini-key",
+			},
+		}
+
+		geminiSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-gemini-key",
+				Namespace: "overseer-system",
+			},
+			Data: map[string][]byte{
+				"GEMINI_API_KEY": []byte("test-key"),
+			},
+		}
+
+		// Pre-create ClusterRoleBindings to verify the controller never appends tenant ServiceAccounts to them.
+		overseerCRB := &rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "overseer-binding"},
+			RoleRef: rbacv1.RoleRef{
+				Kind:     "ClusterRole",
+				Name:     "overseer",
+				APIGroup: "rbac.authorization.k8s.io",
+			},
+		}
+		sandboxCRB := &rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "overseer-sandbox"},
+			RoleRef: rbacv1.RoleRef{
+				Kind:     "ClusterRole",
+				Name:     "overseer-sandbox",
+				APIGroup: "rbac.authorization.k8s.io",
+			},
+		}
+
+		k8sClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&overseerv1alpha1.Overseer{}).
+			WithObjects(overseer, geminiSecret, overseerCRB, sandboxCRB).
+			Build()
+
+		r := &OverseerReconciler{
+			Client: k8sClient,
+			Scheme: scheme,
+		}
+
+		if _, err := r.Reconcile(ctx, ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: "tenant-isolation"},
+		}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		targetNS := "overseer-tenant-isolation"
+
+		for _, rbName := range []string{"overseer-binding", "overseer-sandbox-binding"} {
+			var rb rbacv1.RoleBinding
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: rbName, Namespace: targetNS}, &rb); err != nil {
+				t.Fatalf("expected RoleBinding %s in namespace %s: %v", rbName, targetNS, err)
+			}
+		}
+
+		for _, crbName := range []string{"overseer-binding", "overseer-sandbox"} {
+			var crb rbacv1.ClusterRoleBinding
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: crbName}, &crb); err != nil {
+				t.Fatalf("failed to get ClusterRoleBinding %s: %v", crbName, err)
+			}
+			if len(crb.Subjects) != 0 {
+				t.Errorf("ClusterRoleBinding %s should not have tenant subjects added, got: %+v", crbName, crb.Subjects)
+			}
+		}
+	})
 }

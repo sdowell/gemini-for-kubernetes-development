@@ -35,11 +35,10 @@ The application uses [Gorilla Sessions](https://github.com/gorilla/sessions) to 
 *   **Resource scoping**: All interactions with the Kubernetes API for a specific user are scoped to their namespace.
 
 ### Service Accounts and RBAC
-When a user's namespace is bootstrapped, the following Service Accounts are created within it:
-*   `review-sandbox`
-*   `issue-sandbox`
-
-These Service Accounts are bound to corresponding **ClusterRoles** (e.g., `review-sandbox`, `configdir-controller`), granting the sandboxes specific permissions needed to operate (like reading secrets or syncing config directories) *only within their namespace*.
+Tenant sandboxes operate with least-privilege, namespace-scoped isolation and are never added to cluster-wide `ClusterRoleBinding`s:
+*   Standard review and fix sandboxes run with no Kubernetes API RBAC privileges.
+*   Runbook and research sandboxes run as the per-namespace `factory-deployer` ServiceAccount (created on demand for GCP Workload Identity federation), which carries no Kubernetes RBAC bindings.
+*   When user IAM bindings are configured, they are bound strictly via namespace-scoped `RoleBinding`s (never `ClusterRoleBinding`s), ensuring permissions apply *only within their namespace*.
 
 ## 4. Secret Management
 
@@ -89,11 +88,9 @@ Users can provide their own credentials via the `/settings` page.
 ### 3. Sandbox Creation (Review/Issue/Dev)
 *   **Trigger**: New PR detected or User requests a Dev Sandbox.
 *   **Controller**:
-    *   Creates a `ReviewSandbox`/`DevSandbox` CR in `<username>` namespace.
-    *   Sets `OwnerReference` to the `RepoWatch`.
+    *   Creates a `Sandbox` CR in `<username>` namespace.
 *   **Pod Execution**:
     *   The Sandbox Pod starts in `<username>` namespace.
-    *   It uses the `review-sandbox` (or similar) ServiceAccount.
     *   It mounts secrets (e.g., API keys) from `<username>` namespace.
     *   `configdir-cli` sidecar syncs configurations from `ConfigDir` resources in `<username>` namespace.
 
