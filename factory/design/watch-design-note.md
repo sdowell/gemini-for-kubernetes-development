@@ -95,6 +95,7 @@ When processing a PR, the scan evaluates conditions and queues tasks in three ph
 
 ### Phase 1: Rebase / Merge Conflicts (`pr-iterate`)
 * **Trigger**: The PR is in a conflicting merge state (`Mergeable == false`).
+* **Trigger (merge queue eviction)**: The PR's latest `RemovedFromMergeQueueEvent` has a failure reason (e.g. `failed_checks`), is newer than its latest commit, and no task has yet been queued for it, while the head is mergeable and green. The merge queue tests the PR merged into the current base branch on a temporary merge-group commit, so a semantic conflict (e.g. the base branch removed a function the PR calls) fails there without ever showing on the PR's head. The task is a `pr-iterate` with trigger reason `PRMergeQueueEvicted`, whose instructions tell the agent to rebase, build and test the whole project, and fix what broke, pointing it at the failing checks on the merge-group commit. It is queued once per eviction (`lastEvictionHandledAt`, recovered from processed tasks on restart); the PR is not marked ready-for-human until it has been.
 * **Assignment**: The bot user stays assigned to the PR on GitHub while the rebase task is executing.
 
 ### Phase 2: Review Feedback / Comments (`pr-comments`)

@@ -151,3 +151,10 @@ func (c *Client) ListAllReviewComments(ctx context.Context, number int) ([]*gith
 func (c *Client) IsInMergeQueue(ctx context.Context, number int) (bool, error) {
 	return IsPRInMergeQueue(ctx, c.owner, c.repo, number)
 }
+
+// LatestMergeQueueEviction returns the most recent removal of a pull request
+// from the repository's merge queue, or nil if it has never been removed from
+// one.
+func (c *Client) LatestMergeQueueEviction(ctx context.Context, number int) (*MergeQueueEviction, error) {
+	return LatestMergeQueueEviction(ctx, c.owner, c.repo, number)
+}

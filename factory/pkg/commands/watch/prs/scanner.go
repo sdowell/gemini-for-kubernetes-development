@@ -463,6 +463,17 @@ func (s *Scanner) evaluate(ctx context.Context, prIssue *githubv39.Issue) {
 		}
 	}
 
+	// Check Phase 1b: Merge queue eviction. A pull request that merges
+	// cleanly and is green on its own head can still have been thrown out of
+	// the merge queue, whose checks run on the change merged into the current
+	// base branch. Only worth the extra query when nothing closer to hand is
+	// wrong: a conflict or a failing head is handled first, and its fix
+	// rebases or re-runs CI anyway.
+	var eviction *github.MergeQueueEviction
+	if !isConflicting && !checkAnalysis.hasFailure && !checkAnalysis.hasPending {
+		eviction = s.unaddressedEviction(ctx, num, history.lastCommitTime, state.lastEvictionHandledAt)
+	}
+
 	assignedBot := conventions.AssignedBotUser(prIssue, s.cfg.BotUsers)
 	isExplicitlyAssigned := assignedBot != ""
 
@@ -507,11 +518,19 @@ func (s *Scanner) evaluate(ctx context.Context, prIssue *githubv39.Issue) {
 	case canInvestigate:
 		completed = s.handlePRInvestigate(ctx, pc, checkAnalysis, history.comments)
 
+	case eviction != nil:
+		completed = s.handlePRMergeQueueEviction(ctx, pc, eviction)
+
 	case canReview:
 		completed = s.handlePRReview(ctx, pc, checkAnalysis.checkRuns)
 	}
 
-	s.reconcileReadiness(ctx, pc, checkAnalysis, hasUnresolvedComments, history, isConflicting, assignedBot)
+	// An eviction holds the pull request back from a human only until a task
+	// has been queued for it; after that, the active task does, and once the
+	// task is done its report is on the pull request for the human to read,
+	// whether or not it pushed anything.
+	isEvicted := eviction != nil && eviction.At.After(s.state.get(num).lastEvictionHandledAt)
+	s.reconcileReadiness(ctx, pc, checkAnalysis, hasUnresolvedComments, history, isConflicting, isEvicted, assignedBot)
 	if !completed {
 		return
 	}
@@ -520,6 +539,36 @@ func (s *Scanner) evaluate(ctx context.Context, prIssue *githubv39.Issue) {
 	// request next cycle. Every path that returns before this point left
 	// something unresolved and must be looked at again.
 	s.recordEvaluation(prIssue, pr, checkAnalysis)
+}
+
+// unaddressedEviction returns the pull request's latest merge queue eviction
+// if it was a failure, nothing has been pushed since, and no task has been
+// queued for it yet; or nil otherwise.
+//
+// A commit newer than the eviction means someone - a person, or a task this
+// watcher queued - has already acted on it, and whether that worked is for the
+// next trip through the merge queue to say. An eviction a task was already
+// queued for is answered even if that task pushed nothing, and must not keep
+// pre-empting the phases below it. A failed lookup is logged and treated as no
+// eviction: it must not hold up the rest of the evaluation.
+func (s *Scanner) unaddressedEviction(ctx context.Context, num int, lastCommitTime, lastHandled time.Time) *github.MergeQueueEviction {
+	eviction, err := s.gh.LatestMergeQueueEviction(ctx, num)
+	if err != nil {
+		klog.Errorf("Failed to check merge queue evictions for PR #%d: %v", num, err)
+		return nil
+	}
+	if !eviction.IsFailure() {
+		return nil
+	}
+	if !eviction.At.After(lastCommitTime) {
+		klog.V(2).Infof("PR #%d merge queue eviction at %s predates its latest commit at %s; ignoring", num, eviction.At.Format(time.RFC3339), lastCommitTime.Format(time.RFC3339))
+		return nil
+	}
+	if !eviction.At.After(lastHandled) {
+		klog.V(2).Infof("PR #%d merge queue eviction at %s was already handed to a task; ignoring", num, eviction.At.Format(time.RFC3339))
+		return nil
+	}
+	return eviction
 }
 
 // recordEvaluation notes what the evaluation that just finished saw, which is
@@ -553,6 +602,7 @@ func (s *Scanner) reconcileReadiness(
 	hasPendingComments bool,
 	history *prHistory,
 	isConflicting bool,
+	isEvicted bool,
 	assignedBot string,
 ) {
 	num := pc.prIssue.GetNumber()
@@ -562,6 +612,7 @@ func (s *Scanner) reconcileReadiness(
 	reviewSatisfied := !isReviewRequired || hasBotReviewOnHead
 
 	isReadyForHuman := !isConflicting &&
+		!isEvicted &&
 		pc.pr.GetMergeable() &&
 		!checkAnalysis.hasFailure &&
 		!checkAnalysis.hasPending &&

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	githubv39 "github.com/google/go-github/v39/github"
@@ -12,6 +13,7 @@ import (
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/common"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/api"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/conventions"
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/github"
 )
 
 // maxInvestigations is how many times CI failures on the same revision are
@@ -115,6 +117,133 @@ func (s *Scanner) handlePRIterate(ctx context.Context, pc *prContext) {
 	if err := s.queue.Enqueue(filename, task); err != nil {
 		klog.Errorf("Failed to queue rebase task for PR #%d: %v", num, err)
 	}
+}
+
+// handlePRMergeQueueEviction queues a rebase-and-fix for a pull request that
+// was removed from the merge queue because it failed there, while its own head
+// neither conflicts nor fails CI.
+//
+// That combination almost always means a semantic conflict: something that
+// landed on the base branch after the pull request was branched - a renamed or
+// removed function, type or field, say - breaks the change without touching a
+// line of it. A plain rebase does not fix that, so the task runs the rebase
+// recipe with instructions to build and test the whole result, and to fix what
+// the base branch broke.
+//
+// It is gated on the eviction rather than on the head SHA: the task is the
+// answer to one eviction, and a run that finds nothing to push must not be
+// repeated until the queue evicts the pull request again. It reports whether
+// the phase completed cleanly; a false return means a sandbox probe or enqueue
+// failed and the pull request must be looked at again next cycle.
+func (s *Scanner) handlePRMergeQueueEviction(ctx context.Context, pc *prContext, eviction *github.MergeQueueEviction) bool {
+	num := pc.prIssue.GetNumber()
+	state := s.state.get(num)
+
+	if !state.lastEvictionHandledAt.IsZero() && !eviction.At.After(state.lastEvictionHandledAt) {
+		klog.Infof("Skipping PR #%d merge queue eviction at %s because a rebase-and-fix task was already queued for it.", num, eviction.At.Format(time.RFC3339))
+		return true
+	}
+
+	// The same file name as a conflict rebase: both run the rebase recipe in
+	// the PR's sandbox, and two of them at once would fight over the branch.
+	filename := fmt.Sprintf("task-pr-%d-iterate.yaml", num)
+	if s.queue.TaskExists(filename) {
+		return true
+	}
+
+	sandboxName := s.sandboxes.ResolveName(ctx, api.TypePRIterate, num)
+	running, err := s.sandboxes.IsTaskRunning(ctx, sandboxName)
+	if err != nil {
+		klog.Errorf("Failed to check if sandbox %s is running: %v", sandboxName, err)
+		return false
+	} else if running {
+		klog.Infof("Skipping PR #%d merge queue fix because there is an in-flight sandbox %s.", num, sandboxName)
+		return false
+	}
+
+	baseRef := ""
+	if pc.pr.GetBase() != nil {
+		baseRef = pc.pr.GetBase().GetRef()
+	}
+
+	// The checks that evicted the pull request ran on the merge-group commit,
+	// so that is where the failure is read from. A failed read only costs the
+	// agent a hint: it can still find the runs from the commit SHA.
+	failure := ""
+	if eviction.MergeGroupSHA != "" {
+		analysis, err := s.evaluateChecks(ctx, eviction.MergeGroupSHA)
+		if err != nil {
+			klog.Warningf("Failed to read merge queue checks for PR #%d on %s: %v", num, eviction.MergeGroupSHA, err)
+		} else if analysis.hasFailure {
+			failure = fmt.Sprintf("earliest failure in '%s' (%s); %d failed check(s)", analysis.earliestFailureName, analysis.earliestFailureConclusion, analysis.failedCount)
+		}
+	}
+
+	notes := fmt.Sprintf("PR #%d was removed from the merge queue at %s (reason: %s); merge-group commit %s; head commit %s committer date %s",
+		num, eviction.At.Format(time.RFC3339), eviction.Reason, abbrevSHA(eviction.MergeGroupSHA), pc.shortSHA, pc.lastCommitTime.Format(time.RFC3339))
+	if failure != "" {
+		notes += "; " + failure
+	}
+
+	task := s.newTask(taskOptions{
+		Type:             api.TypePRIterate,
+		PR:               pc.pr,
+		PRIssue:          pc.prIssue,
+		Phase:            api.PhaseRebase,
+		Assignee:         pc.taskAssignee,
+		CommitSHA:        pc.headSHA,
+		TriggerEventTime: eviction.At,
+		TriggerReason:    api.TriggerReasonPRMergeQueueEvicted,
+		TriggerNotes:     notes,
+		Instructions:     []string{mergeQueueEvictionInstructions(baseRef, eviction, failure)},
+	})
+
+	if s.cfg.DryRun {
+		fmt.Printf("[DRYRUN] Would queue merge queue fix task for PR #%d: %s\n", num, pc.prURL)
+		return true
+	}
+	fmt.Printf("Queueing merge queue fix task for PR #%d...\n", num)
+	// Recorded before the enqueue, as for a conflict rebase: a failed write is
+	// retried by the queue rather than re-queued by the next cycle.
+	state.lastEvictionHandledAt = eviction.At
+	s.state.set(num, state)
+	if err := s.queue.Enqueue(filename, task); err != nil {
+		klog.Errorf("Failed to queue merge queue fix task for PR #%d: %v", num, err)
+		return false
+	}
+	return true
+}
+
+// mergeQueueEvictionInstructions tells the rebase agent why it is rebasing a
+// pull request that has no conflicts: the recipe on its own would rebase, find
+// nothing to resolve, and push a branch that fails the merge queue again.
+func mergeQueueEvictionInstructions(baseRef string, eviction *github.MergeQueueEviction, failure string) string {
+	if baseRef == "" {
+		baseRef = "the default branch"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "This pull request was removed from the merge queue at %s (reason: %s). ", eviction.At.Format(time.RFC3339), eviction.Reason)
+	fmt.Fprintf(&b, "Its own head has no merge conflicts and passes CI, but the merge queue tests it merged into the current %s, and there it failed. ", baseRef)
+	b.WriteString("The usual cause is a change that landed on the base branch after this pull request was branched - a renamed or removed function, type, field or file it depends on - which breaks it without conflicting textually.\n\n")
+	if eviction.MergeGroupSHA != "" {
+		fmt.Fprintf(&b, "The failing merge queue checks ran on merge-group commit %s. If the gh CLI is available, find them with `gh run list --commit %s` and read the errors with `gh run view <run-id> --log-failed`.", eviction.MergeGroupSHA, eviction.MergeGroupSHA)
+		if failure != "" {
+			fmt.Fprintf(&b, " Summary: %s.", failure)
+		}
+		b.WriteString("\n\n")
+	}
+	b.WriteString("After rebasing, do not stop at resolving conflicts: there may be none. Build the whole project and run its linters and the tests covering what this pull request touches, as its CI would. ")
+	b.WriteString("Fix every failure so the change works on top of the current base branch while still doing what it did, following how the base branch now does things (for example, migrate to the API that replaced a removed one). ")
+	b.WriteString("In your report, say what the base branch changed, what it broke, and how you fixed it.")
+	return b.String()
+}
+
+// abbrevSHA abbreviates a commit SHA for messages.
+func abbrevSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
 }
 
 // canInvestigatePR reports whether CI failures on this pull request are worth

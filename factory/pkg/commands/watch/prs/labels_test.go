@@ -545,7 +545,7 @@ func TestReconcileReadyForHumanLabel(t *testing.T) {
 				},
 			}
 
-			s.reconcileReadiness(context.Background(), pc, prCheckAnalysis{}, false, history, !tc.isReady, "")
+			s.reconcileReadiness(context.Background(), pc, prCheckAnalysis{}, false, history, !tc.isReady, false, "")
 
 			if len(recordedCalls) != len(tc.expectedCalls) {
 				t.Fatalf("recorded %d API calls (%v); want %d (%v)", len(recordedCalls), recordedCalls, len(tc.expectedCalls), tc.expectedCalls)

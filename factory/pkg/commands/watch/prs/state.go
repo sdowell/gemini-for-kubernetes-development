@@ -29,6 +29,12 @@ type prState struct {
 	lastIteratedSHA string
 	// lastIteratedTime is when a rebase was last queued or completed.
 	lastIteratedTime time.Time
+	// lastEvictionHandledAt is the time of the most recent merge queue
+	// eviction a rebase-and-fix task was queued for. It is a timestamp rather
+	// than a SHA because the eviction, not the head commit, is what the task
+	// answers: a task that pushes nothing leaves the head unchanged, and must
+	// still not be queued again for the same eviction.
+	lastEvictionHandledAt time.Time
 
 	// The three fields below record what the last *complete* evaluation saw,
 	// and exist for the fast pass's skip gate (see Scanner.needsEvaluation).
@@ -211,6 +217,12 @@ func foldProcessedPRTask(t *api.QueueTask, name string, state prState) prState {
 	case strings.HasSuffix(name, "-review"):
 		if t.CommitSHA != "" {
 			state.lastReviewedSHA = t.CommitSHA
+		}
+	case strings.HasSuffix(name, "-iterate") && t.TriggerReason == api.TriggerReasonPRMergeQueueEvicted:
+		// Kept apart from the conflict rebases below: answering an eviction
+		// says nothing about whether this head has since come to conflict.
+		if t.TriggerEventTime.After(state.lastEvictionHandledAt) {
+			state.lastEvictionHandledAt = t.TriggerEventTime
 		}
 	case strings.HasSuffix(name, "-iterate"):
 		if tTime.After(state.lastIteratedTime) {

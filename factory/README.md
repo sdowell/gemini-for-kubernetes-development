@@ -55,7 +55,8 @@
   1. unaddressed feedback → `recipe care-comments`
   2. merge conflict → `recipe care-rebase`
   3. failing CI → `recipe care-ci`
-  4. green and labelled for review → `recipe review`
+  4. evicted from the merge queue for failing there (green and mergeable on its own head, but broken on top of the base branch) → `recipe care-rebase`, instructed to rebase, build and test everything, and fix what the base branch broke
+  5. green and labelled for review → `recipe review`
 
   A PR that passes review is labelled `<trigger>/ready-for-human` and handed to the human assignees. `--pr-inactivity-timeout` pauses PRs that no human has touched for that long.
 - **Chores.** Agent definitions under `.agents/` that have a cron `schedule` run as `agent-chore` tasks (`--chores-mode`).

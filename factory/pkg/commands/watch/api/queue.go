@@ -74,6 +74,11 @@ const (
 	// TriggerReasonPRMergeConflict indicates the task was triggered by merge conflicts with the base branch.
 	TriggerReasonPRMergeConflict TriggerReason = "PRMergeConflict"
 
+	// TriggerReasonPRMergeQueueEvicted indicates the task was triggered because the PR was removed
+	// from the merge queue after failing there, although it neither conflicts with nor fails CI on
+	// its own head: something that landed on the base branch broke it.
+	TriggerReasonPRMergeQueueEvicted TriggerReason = "PRMergeQueueEvicted"
+
 	// TriggerReasonPRReadyForReview indicates the task was triggered because all CI checks passed and the PR is ready for automated review.
 	TriggerReasonPRReadyForReview TriggerReason = "PRReadyForReview"
 
