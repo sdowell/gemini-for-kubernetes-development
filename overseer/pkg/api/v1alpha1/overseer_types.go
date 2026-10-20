@@ -45,6 +45,15 @@ type RepoSpec struct {
 	// +kubebuilder:default=enabled
 	// +kubebuilder:validation:Optional
 	IssueMode string `json:"issueMode,omitempty"`
+
+	// PipelineMode is whether issue pipelines are reconciled
+	// (factory/design/issue-pipelines.md): enabled, disabled, or dryrun
+	// (reconcile and log, change nothing). Off by default while pipelines
+	// roll out; they also need issueMode on.
+	// +kubebuilder:validation:Enum=enabled;disabled;dryrun
+	// +kubebuilder:default=disabled
+	// +kubebuilder:validation:Optional
+	PipelineMode string `json:"pipelineMode,omitempty"`
 }
 
 // OverseerRules is how the watch rules run beside the watcher's scanners.

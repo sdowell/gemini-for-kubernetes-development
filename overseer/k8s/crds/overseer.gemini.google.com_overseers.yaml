@@ -85,6 +85,13 @@ spec:
                     - disabled
                     - dryrun
                     type: string
+                  pipelineMode:
+                    default: disabled
+                    enum:
+                    - enabled
+                    - disabled
+                    - dryrun
+                    type: string
                   prMode:
                     default: enabled
                     enum:

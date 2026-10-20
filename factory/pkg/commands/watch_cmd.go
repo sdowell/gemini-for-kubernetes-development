@@ -56,7 +56,13 @@ func NewWatchCommand(ctx context.Context) *cobra.Command {
 			if flags.ChoresMode == "" {
 				flags.ChoresMode = "enabled"
 			}
-			for _, m := range []struct{ name, value string }{{"issue-mode", flags.IssueMode}, {"pr-mode", flags.PRMode}, {"chores-mode", flags.ChoresMode}} {
+			if flags.PipelineMode == "" {
+				flags.PipelineMode = os.Getenv("PIPELINE_MODE")
+			}
+			if flags.PipelineMode == "" {
+				flags.PipelineMode = "disabled"
+			}
+			for _, m := range []struct{ name, value string }{{"issue-mode", flags.IssueMode}, {"pr-mode", flags.PRMode}, {"chores-mode", flags.ChoresMode}, {"pipeline-mode", flags.PipelineMode}} {
 				if !validMode(m.value) {
 					return fmt.Errorf("--%s %q: want enabled, disabled or dryrun", m.name, m.value)
 				}
@@ -82,6 +88,7 @@ func NewWatchCommand(ctx context.Context) *cobra.Command {
 	cmd.Flags().StringVar(&flags.IssueMode, "issue-mode", "", "Issue mode: enabled, disabled, or dryrun (scan and log, change nothing) (defaults to ISSUE_MODE env or enabled)")
 	cmd.Flags().StringVar(&flags.PRMode, "pr-mode", "", "PR mode: enabled, disabled, or dryrun (scan and log, change nothing) (defaults to PR_MODE env or enabled)")
 	cmd.Flags().StringVar(&flags.ChoresMode, "chores-mode", "", "Chores mode: enabled, disabled, or dryrun (log what is due, queue nothing) (defaults to CHORES_MODE env or enabled)")
+	cmd.Flags().StringVar(&flags.PipelineMode, "pipeline-mode", "", "Issue pipeline mode: enabled, disabled, or dryrun (reconcile and log, change nothing); pipelines also need issues scanned (defaults to PIPELINE_MODE env or disabled; see factory/design/issue-pipelines.md)")
 	cmd.Flags().IntVar(&flags.ScanLimit, "scan-limit", 100, "Maximum number of issues/PRs to fetch from GitHub API in a scan cycle")
 	cmd.Flags().DurationVar(&flags.TaskTimeout, "task-timeout", common.GetEnvDuration("TASK_TIMEOUT", 24*time.Hour), "Timeout for each task execution, after which the task is failed and its sandbox deleted (e.g. '3h', '24h')")
 	cmd.Flags().StringVar(&flags.SandboxEvictionAge, "sandbox-eviction-age", "7d", "Age threshold for idle sandbox eviction (e.g. '7d', '24h')")

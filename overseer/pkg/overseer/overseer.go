@@ -327,6 +327,12 @@ func newOverseerSandboxFromOverseer(o *overseerv1alpha1.Overseer, name, namespac
 				"value": o.Spec.Repo.IssueMode,
 			})
 		}
+		if o.Spec.Repo.PipelineMode != "" {
+			env = append(env, map[string]interface{}{
+				"name":  "PIPELINE_MODE",
+				"value": o.Spec.Repo.PipelineMode,
+			})
+		}
 	}
 
 	if o.Spec.SandboxEvictionAge != "" {

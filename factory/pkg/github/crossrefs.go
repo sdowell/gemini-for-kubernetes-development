@@ -15,11 +15,19 @@ type IssueRef struct {
 	Title  string
 	Body   string
 	Open   bool
-	// StateReason is a closed issue's: "completed" or "not_planned".
+	// StateReason is a closed issue's: "completed", "not_planned" or
+	// "duplicate".
 	StateReason string
 	// Merged is a pull request that was merged.
 	Merged bool
 	Labels []string
+	// Author is the login of the account that opened it.
+	Author string
+	// Assignees are the logins it is assigned to.
+	Assignees []string
+	CreatedAt time.Time
+	// ClosedAt is zero while it is open.
+	ClosedAt time.Time
 }
 
 // rawIssue is the part of GitHub's issue JSON an IssueRef is read from.
@@ -33,6 +41,14 @@ type rawIssue struct {
 	Labels        []struct {
 		Name string `json:"name"`
 	} `json:"labels"`
+	User *struct {
+		Login string `json:"login"`
+	} `json:"user"`
+	Assignees []struct {
+		Login string `json:"login"`
+	} `json:"assignees"`
+	CreatedAt   *time.Time `json:"created_at"`
+	ClosedAt    *time.Time `json:"closed_at"`
 	PullRequest *struct {
 		MergedAt *time.Time `json:"merged_at"`
 	} `json:"pull_request"`
@@ -50,6 +66,18 @@ func (r rawIssue) ref() IssueRef {
 	}
 	for _, l := range r.Labels {
 		ref.Labels = append(ref.Labels, l.Name)
+	}
+	if r.User != nil {
+		ref.Author = r.User.Login
+	}
+	for _, a := range r.Assignees {
+		ref.Assignees = append(ref.Assignees, a.Login)
+	}
+	if r.CreatedAt != nil {
+		ref.CreatedAt = *r.CreatedAt
+	}
+	if r.ClosedAt != nil {
+		ref.ClosedAt = *r.ClosedAt
 	}
 	return ref
 }

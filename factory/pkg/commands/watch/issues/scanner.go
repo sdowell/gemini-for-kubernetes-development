@@ -26,6 +26,7 @@ import (
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/api"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/conventions"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/github"
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/pipeline"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/watch/rules"
 )
 
@@ -154,6 +155,11 @@ type Config struct {
 	PrimeOpenPRs bool
 	// DryRun reports what would be queued without touching the queue or GitHub.
 	DryRun bool
+	// LabelPipelines labels the pipeline parents the scanner finds -
+	// issues with a factory-pipeline block - '<trigger>/pipeline', for the
+	// pipeline reconciler to list. Parents are never queued as tasks
+	// either way.
+	LabelPipelines bool
 }
 
 // Deps holds the collaborators of a Scanner.
@@ -390,6 +396,10 @@ func (s *Scanner) queueTask(ctx context.Context, issue *githubv39.Issue, refIssu
 	}
 	if why := s.fanoutWork(issue); why != "" {
 		klog.Infof("Skipping issue #%d because %s", num, why)
+		return
+	}
+	if pipeline.HasRequest(issue.GetBody()) {
+		s.routePipelineParent(ctx, issue)
 		return
 	}
 	if refIssues[num] {

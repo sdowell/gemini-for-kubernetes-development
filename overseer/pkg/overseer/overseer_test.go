@@ -239,6 +239,23 @@ func TestBuildSandboxManifest_SessionURL(t *testing.T) {
 	}
 }
 
+// spec.repo.pipelineMode reaches the watcher as PIPELINE_MODE, and only when
+// set.
+func TestBuildSandboxManifest_PipelineMode(t *testing.T) {
+	o := &overseerv1alpha1.Overseer{Spec: overseerv1alpha1.OverseerSpec{RepoURL: "https://github.com/owner/repo"}}
+	if _, ok := overseerEnv(t, o)["PIPELINE_MODE"]; ok {
+		t.Error("PIPELINE_MODE is set with repo unset")
+	}
+	o.Spec.Repo = &overseerv1alpha1.RepoSpec{IssueMode: "enabled"}
+	if _, ok := overseerEnv(t, o)["PIPELINE_MODE"]; ok {
+		t.Error("PIPELINE_MODE is set with pipelineMode unset")
+	}
+	o.Spec.Repo.PipelineMode = "dryrun"
+	if got := overseerEnv(t, o)["PIPELINE_MODE"]; got != "dryrun" {
+		t.Errorf("PIPELINE_MODE = %v, want dryrun", got)
+	}
+}
+
 // spec.sharedScan reaches the watcher as WATCH_SHARED_SCAN, and only when set.
 func TestBuildSandboxManifest_SharedScan(t *testing.T) {
 	o := &overseerv1alpha1.Overseer{Spec: overseerv1alpha1.OverseerSpec{RepoURL: "https://github.com/owner/repo"}}

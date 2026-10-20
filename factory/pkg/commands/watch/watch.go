@@ -29,6 +29,10 @@ func (w *Watcher) Run(ctx context.Context) error {
 			w.issueScanner.ScanOnce(ctx)
 			w.fanouts.SyncOnce(ctx)
 		}
+		if w.pipelines != nil {
+			w.pipelines.CheckPermissions(ctx)
+			w.pipelines.SyncOnce(ctx)
+		}
 		if w.prsEnabled() {
 			w.prScanner.ScanOnce(ctx)
 		}
@@ -70,6 +74,13 @@ func (w *Watcher) Run(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			_ = w.fanouts.Run(daemonCtx)
+		}()
+	}
+	if w.pipelines != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = w.pipelines.Run(daemonCtx)
 		}()
 	}
 	if w.prsEnabled() {
@@ -211,7 +222,7 @@ func (w *Watcher) init(ctx context.Context) error {
 		go startQueueHTTPServer(ctx, w.queueMgr, ":13338", w.rulesShadow)
 	}
 
-	fmt.Printf("Starting watch for repository %s/%s (mode: %s, issues: %s, PRs: %s, chores: %s, queueDir: %s, assignee: '%s', dryRun: %v, watchTimeout: %s)...\n", w.Repo.Owner, w.Repo.Repo, w.Mode, w.IssueMode, w.PRMode, w.ChoresMode, w.QueueDir, w.targetAssignee, w.DryRun, w.WatchTimeout)
+	fmt.Printf("Starting watch for repository %s/%s (mode: %s, issues: %s, PRs: %s, chores: %s, pipelines: %s, queueDir: %s, assignee: '%s', dryRun: %v, watchTimeout: %s)...\n", w.Repo.Owner, w.Repo.Repo, w.Mode, w.IssueMode, w.PRMode, w.ChoresMode, w.PipelineMode, w.QueueDir, w.targetAssignee, w.DryRun, w.WatchTimeout)
 
 	if w.WatchTimeout > 0 {
 		w.timeoutChan = time.After(w.WatchTimeout)

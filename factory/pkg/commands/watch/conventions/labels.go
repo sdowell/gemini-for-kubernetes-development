@@ -64,6 +64,48 @@ func HasFanoutLabel(labels []*githubv39.Label, triggerLabel string) bool {
 	return hasAny(labels, FanoutLabels(triggerLabel))
 }
 
+// PipelineLabel returns the label the issue scanner puts on an issue pipeline
+// parent - an issue whose body has a factory-pipeline block - so the pipeline
+// reconciler can list them. It is in the trigger label's namespace, like
+// StopLabel.
+func PipelineLabel(triggerLabel string) string {
+	return namespace(triggerLabel) + "/pipeline"
+}
+
+// PipelineLabels returns the pipeline parent label's spellings: the
+// 'overseer/' default and the trigger's own.
+func PipelineLabels(triggerLabel string) []string {
+	return namespaced(triggerLabel, "pipeline")
+}
+
+// HasPipelineLabel reports whether an issue is labelled as a pipeline parent.
+func HasPipelineLabel(labels []*githubv39.Label, triggerLabel string) bool {
+	return hasAny(labels, PipelineLabels(triggerLabel))
+}
+
+// PipelineInvalidLabel returns the label the pipeline reconciler puts on a
+// parent whose definition or params do not validate, and takes off once they
+// do.
+func PipelineInvalidLabel(triggerLabel string) string {
+	return namespace(triggerLabel) + "/pipeline-invalid"
+}
+
+// ReviewLabel returns the label that opts an issue's pull request into
+// automated review (design/pr-automated-review.md), in the trigger label's
+// namespace.
+func ReviewLabel(triggerLabel string) string {
+	return namespace(triggerLabel) + "/review"
+}
+
+// namespace is the prefix the watcher writes its own labels under: the
+// trigger label, or 'overseer' when none is configured.
+func namespace(triggerLabel string) string {
+	if triggerLabel != "" {
+		return triggerLabel
+	}
+	return defaultPrefix
+}
+
 // HasTriggerLabel reports whether the trigger label itself is present, which is
 // what marks an issue as the watcher's to work on.
 func HasTriggerLabel(labels []*githubv39.Label, triggerLabel string) bool {

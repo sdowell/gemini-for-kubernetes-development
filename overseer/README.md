@@ -103,6 +103,7 @@ The full schema is in [`pkg/api/v1alpha1/overseer_types.go`](pkg/api/v1alpha1/ov
 | `sessionURL` | Links PR descriptions and follow-up comments to the agent conversation that wrote them: a URL with `{sandbox}` and `{task}`, e.g. a dashboard's session page. Unset, nothing is linked. |
 | `robotAccount`, `geminiAPIKeySecretName` | Secrets (in `overseer-system`) that hold the default GitHub identity and the Gemini key. |
 | `repo.issueMode` / `repo.prMode` | Issue intake (fan-out included) and PR care: `enabled`, `disabled`, or `dryrun` (evaluate and log what would be done, change nothing). Automated reviews run on PRs with the `overseer/review` label. |
+| `repo.pipelineMode` | Issue pipelines ([design](../factory/design/issue-pipelines.md)): a parent issue with a `factory-pipeline` block runs the steps defined in the repository's `.agents/pipelines/<name>.yaml`, one sub-issue at a time. `enabled`, `disabled` (the default), or `dryrun`, as above; needs `repo.issueMode` on. |
 | `chores.mode` | Chore scheduling: `enabled`, `disabled`, or `dryrun`, as above. |
 | `image` | Worker sandbox image, overriding the repository's devcontainer image. |
 | `workspaceDiskSize`, `workspaceStorageClassName`, `ephemeralStorage` | Storage for the Overseer and its sandboxes. |

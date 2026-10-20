@@ -135,6 +135,10 @@ effects or host dependencies.`,
 
 	cmd.AddCommand(NewRecipeCommand(ctx))
 
+	pipelineCmd := NewPipelineCommand(ctx)
+	pipelineCmd.GroupID = "workflows"
+	cmd.AddCommand(pipelineCmd)
+
 	applyCmd := NewApplyCommand(ctx)
 	applyCmd.GroupID = "workflows"
 	cmd.AddCommand(applyCmd)

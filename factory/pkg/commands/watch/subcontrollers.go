@@ -19,6 +19,7 @@ import (
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/dispatcher"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/fanouts"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/issues"
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/pipelines"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/prs"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/sandbox"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/scan"
@@ -81,7 +82,13 @@ func (w *Watcher) newLinkedWork() sandbox.LinkedWork {
 		Sandboxes: w.sandboxes,
 		Users:     watcherUserSelector{w: w},
 	})
-	return linkedWorks{nudger, w.fanouts}
+	works := linkedWorks{nudger, w.fanouts}
+	if w.pipelines != nil {
+		// A closed pipeline child wakes its parent's reconciler rather
+		// than re-running a workflow.
+		works = append(works, w.pipelines)
+	}
+	return works
 }
 
 // linkedWorks tells each of its members about every closed issue, in order.
@@ -91,6 +98,37 @@ func (l linkedWorks) NudgeLinkedWorkflows(ctx context.Context, closed *githubv39
 	for _, lw := range l {
 		lw.NudgeLinkedWorkflows(ctx, closed)
 	}
+}
+
+// pipelinesEnabled reports whether issue pipelines are reconciled: they are
+// issue work, so issues must be scanned too, and PipelineMode must not be
+// disabled (it is by default, while pipelines roll out).
+func (w *Watcher) pipelinesEnabled() bool {
+	return w.issuesEnabled() && w.PipelineMode != "" && w.PipelineMode != "disabled"
+}
+
+// newPipelineController constructs the issue pipeline reconciler, which runs
+// as its own goroutine and keeps every pipeline parent moving, or nil when
+// pipelines are not enabled. It is built before the sandbox reconciler,
+// which wakes it when a child's sandbox is collected.
+func (w *Watcher) newPipelineController() *pipelines.Controller {
+	if !w.pipelinesEnabled() {
+		return nil
+	}
+	return pipelines.New(pipelines.Config{
+		Interval:       pipelines.DefaultInterval,
+		ClosedLookback: pipelines.DefaultClosedLookback,
+		Repo:           w.Repo.Owner + "/" + w.Repo.Repo,
+		TriggerLabel:   w.triggerLabel,
+		GitHubLogin:    w.githubLogin,
+		BotLogins:      w.allBotUsers,
+		TargetAssignee: w.targetAssignee,
+		MinNumber:      w.minIssueNumber(),
+		DryRun:         w.loopDryRun(w.PipelineMode) || w.IssueMode == "dryrun",
+	}, pipelines.Deps{
+		GitHub: w.repoClient,
+		Paused: w.draining,
+	})
 }
 
 // newFanoutController constructs the fan-out controller, which runs as its
@@ -286,6 +324,7 @@ func (w *Watcher) issueScannerConfig() issues.Config {
 		MinNumber:      w.minIssueNumber(),
 		PrimeOpenPRs:   !w.prsEnabled(),
 		DryRun:         w.loopDryRun(w.IssueMode),
+		LabelPipelines: w.pipelinesEnabled(),
 	}
 }
 

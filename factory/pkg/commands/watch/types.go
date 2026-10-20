@@ -15,6 +15,7 @@ import (
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/dispatcher"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/fanouts"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/issues"
+	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/pipelines"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/prs"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/sandbox"
 	"github.com/gke-labs/gemini-for-kubernetes-development/factory/pkg/commands/watch/scan"
@@ -53,19 +54,23 @@ func (r *RepoFlag) Type() string {
 }
 
 type Flags struct {
-	Repo                RepoFlag
-	Assignee            string
-	AssigneeChanged     bool
-	DryRun              bool
-	WatchTimeout        time.Duration
-	MaxActions          int
-	MaxPending          int
-	Mode                string
-	QueueDir            string
-	Once                bool
-	IssueMode           string
-	PRMode              string
-	ChoresMode          string
+	Repo            RepoFlag
+	Assignee        string
+	AssigneeChanged bool
+	DryRun          bool
+	WatchTimeout    time.Duration
+	MaxActions      int
+	MaxPending      int
+	Mode            string
+	QueueDir        string
+	Once            bool
+	IssueMode       string
+	PRMode          string
+	ChoresMode      string
+	// PipelineMode is whether issue pipelines (design/issue-pipelines.md)
+	// are reconciled: enabled, disabled, or dryrun (log what would be
+	// done, change nothing). They need issues scanned as well.
+	PipelineMode        string
 	ScanLimit           int
 	TaskTimeout         time.Duration
 	SandboxEvictionAge  string
@@ -159,14 +164,17 @@ type Watcher struct {
 	// rulesControl is the operator's say over the rules (RulesEngine,
 	// RulesUse, RulesCanaryLabel, RulesDisabled); nil is the scanners
 	// alone, every rule on.
-	rulesControl  *rules.Control
-	sandboxes     *sandbox.Service
-	dispatcher    *dispatcher.Dispatcher
-	reconciler    *sandbox.Reconciler
-	chores        *chores.Scheduler
-	issueScanner  *issues.Scanner
-	prScanner     *prs.Scanner
-	fanouts       *fanouts.Controller
+	rulesControl *rules.Control
+	sandboxes    *sandbox.Service
+	dispatcher   *dispatcher.Dispatcher
+	reconciler   *sandbox.Reconciler
+	chores       *chores.Scheduler
+	issueScanner *issues.Scanner
+	prScanner    *prs.Scanner
+	fanouts      *fanouts.Controller
+	// pipelines is the issue pipeline reconciler; nil when PipelineMode
+	// does not run it.
+	pipelines     *pipelines.Controller
 	warmWorkspace *warmworkspace.Controller
 	timeoutChan   <-chan time.Time
 }
@@ -209,6 +217,7 @@ func (w *Watcher) initComponents() {
 	})
 	w.dispatcher = w.newDispatcher(w.newCLIRunner())
 	w.fanouts = w.newFanoutController()
+	w.pipelines = w.newPipelineController()
 	w.warmWorkspace = w.newWarmWorkspaceController()
 	w.reconciler = w.newReconciler()
 	w.chores = w.newChoreScheduler()
