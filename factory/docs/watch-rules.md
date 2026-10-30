@@ -190,6 +190,7 @@ the merge queue get nothing from any rule.
 | `opened-by` | `watcher` | the watcher's own login opened it |
 | `fanout` | `true`, `false` | it is a fan-out's parent (the fanout label): the fan-out controller's, never fixed itself. A child is an ordinary issue, created when it is to be worked on |
 | `graph` | `true`, `false` | it is an issue graph's parent (the graph label): the graph controller's, never fixed itself. A child is an ordinary issue, created when its step is ready ([issue graphs](../design/issue-graph.md)) |
+| `unchanged` | `none`, `open` | a fix's word that nothing should change stands: open-pr's comment for a fix that made no commit (it carries the unchanged marker), by a pool bot or the watcher, with no trusted human's comment after it (open), or not. Read from the issue's comments, only when a rule that could otherwise step asks for it, and not for an issue with no comments. The prebaked `fix` says `none`: a fix that changed nothing is not run again - whatever label, assignee or bot comment touches the issue - until a maintainer answers it |
 | `questions` | `none`, `open` | the issue's own description still asks: its `## Questions` section has a question with no box ticked (open), or not. From the issue's body, no read of its own. The prebaked `fix` says `none`: an issue waits on its questions, then is fixed |
 | `plan` | `none`, `pr`, `graph`, `asking`, `replanning` | the shape of the issue's plan: its plan comment (key `plan`, the plan recipe's) by a pool bot or a maintainer - none; one without a Breakdown (one PR); one with a `yaml graph` block (an issue graph, [plans](../design/issue-graph-plans.md)); one still asking - its `## Questions` section has a question with no box ticked - is `asking`, whatever else it holds; one whose questions are all ticked but still carries the section (the plan is being rewritten with the answers) is `replanning`. Read from the issue's comments, so only when a rule that could otherwise step asks for it. A graph-labelled issue whose plan has a Breakdown is started from its plan |
 
@@ -443,7 +444,7 @@ neither rule decides (an edited body naming a workflow waits for the fix). `read
 writes labels but takes the item: it must not hold beside a care rule, nor
 while a task runs.
 
-Some facts cost a GitHub call per issue: `connected-pr` (the timeline), `plan` (the comments),
+Some facts cost a GitHub call per issue: `connected-pr` (the timeline), `plan` and `unchanged` (the comments),
 and, for an issue naming a workflow, its definition (`workflow: any` and
 `missing`) and its cooldown (`{{workflow-cooldown}}`). The scan reads
 them only when a rule that would step on every other fact uses them, so a

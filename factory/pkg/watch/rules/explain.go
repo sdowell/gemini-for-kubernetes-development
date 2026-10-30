@@ -218,6 +218,14 @@ func factOf(predicate string, it Item, env Env, runs []PastRun) string {
 			return "plan not read"
 		}
 		return "plan " + orNone(it.Plan)
+	case "unchanged":
+		if it.unknown(FactUnchanged) {
+			return "unchanged not read"
+		}
+		if it.UnchangedOpen {
+			return "unchanged open: a fix said nothing should change, and no one has answered"
+		}
+		return "unchanged none"
 	case "workflow":
 		if it.WorkflowMissing {
 			return "workflow " + it.Workflow + ", which cannot be loaded"
@@ -512,6 +520,9 @@ func (r *Rule) facts(runs []PastRun) []string {
 		}
 		if w.Plan != "" {
 			add(FactPlan)
+		}
+		if w.Unchanged != "" {
+			add(FactUnchanged)
 		}
 		if w.Workflow == "any" || w.Workflow == "missing" {
 			add(FactWorkflowDefinition)

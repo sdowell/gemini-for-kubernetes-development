@@ -48,6 +48,12 @@ when:
   # needs-human meanwhile); the fix starts once each is answered, and the
   # agent follows the answers.
   questions: none
+  # Not while a fix's word that nothing should change stands: a fix that
+  # made no commit says why on the issue (open-pr's comment, with its
+  # marker) and opens no PR, so linked-pr stays none; without this, any
+  # label, assignee or bot comment that touches the issue would run the
+  # fix again. A trusted human's comment after it starts the fix again.
+  unchanged: none
   # No open PR connected to it on its timeline either (a read of its own,
   # made only when the rest holds); a workflow's steps open PRs that do.
   connected-pr: none

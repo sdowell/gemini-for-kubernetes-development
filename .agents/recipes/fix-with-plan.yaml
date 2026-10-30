@@ -158,7 +158,8 @@ start:
             fixed it, the duplicate, the decision a maintainer must make),
             and what would need to be true for a change to be right.
 
-        It is posted on the issue, and no pull request is opened.
+        It is posted on the issue, and no pull request is opened; the issue
+        is left alone until a maintainer answers.
 
         Rules:
         - The body MUST contain a line of exactly the form

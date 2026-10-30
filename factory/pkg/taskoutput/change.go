@@ -108,6 +108,15 @@ type Pushed struct {
 // PushedFile is the task-directory file the push step records Pushed in.
 const PushedFile = "push.json"
 
+// UnchangedMarker ends the comment open-pr posts on an issue a fix changed
+// nothing for (commentUnchanged), whatever its task: what the watch reads
+// to leave the issue alone until someone answers it (IsUnchangedComment).
+const UnchangedMarker = "<!-- factory:unchanged -->"
+
+// IsUnchangedComment reports whether a comment's body is a fix's saying
+// nothing should change (UnchangedMarker).
+func IsUnchangedComment(body string) bool { return strings.Contains(body, UnchangedMarker) }
+
 // ChangeSpec decodes a Change document's spec.
 func (d *Document) ChangeSpec() (*Change, error) {
 	c, err := d.changeSpec()
@@ -353,7 +362,9 @@ func applyOpenPR(ctx context.Context, gh *githubv39.Client, doc *Document, dryRu
 }
 
 // commentUnchanged is open-pr for a fix that changed nothing: it posts the
-// Change's comment, why, on the issue, once per task, and opens no PR.
+// Change's comment, why, on the issue, once per task, and opens no PR. The
+// comment carries UnchangedMarker, which holds the watch's fix off the
+// issue until a trusted human answers it (the unchanged predicate).
 func commentUnchanged(ctx context.Context, gh *githubv39.Client, doc *Document, c *Change, owner, repo string, dryRun bool, out io.Writer) error {
 	_, _, num, isPR, err := parseItemURL(doc.Target.URL)
 	if err != nil {
@@ -376,7 +387,7 @@ func commentUnchanged(ctx context.Context, gh *githubv39.Client, doc *Document, 
 	if dryRun {
 		return nil
 	}
-	body := withSessionHint(ctx, c.Comment) + marker(doc)
+	body := withSessionHint(ctx, c.Comment) + "\n\n" + UnchangedMarker + marker(doc)
 	if _, _, err := gh.Issues.CreateComment(ctx, owner, repo, num, &githubv39.IssueComment{Body: &body}); err != nil {
 		return fmt.Errorf("commenting why the fix changed nothing: %w", err)
 	}

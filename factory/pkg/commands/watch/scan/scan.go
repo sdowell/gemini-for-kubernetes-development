@@ -53,8 +53,9 @@ const (
 	DefaultReuseFor = 30 * time.Second
 
 	// stateVersion is the persisted snapshot's format. A different one is
-	// treated as no snapshot. 2: items keep their author_association.
-	stateVersion = 2
+	// treated as no snapshot. 2: items keep their author_association. 3:
+	// and their comment count.
+	stateVersion = 3
 )
 
 // Lister is the GitHub call a Store makes. *github.Client implements it.
@@ -515,6 +516,9 @@ func reduce(item *githubv39.Issue) *githubv39.Issue {
 		ClosedAt:          item.ClosedAt,
 		PullRequestLinks:  item.PullRequestLinks,
 		AuthorAssociation: item.AuthorAssociation,
+		// Whether the issue has comments at all: an issue with none has
+		// no comment of a fix's to read (the rules' unchanged fact).
+		Comments: item.Comments,
 	}
 	if u := item.User; u != nil {
 		r.User = &githubv39.User{Login: u.Login, Type: u.Type}

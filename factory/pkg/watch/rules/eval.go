@@ -52,6 +52,10 @@ type Item struct {
 	// QuestionsOpen is that the issue's description still asks
 	// (When.Questions).
 	QuestionsOpen bool `json:",omitempty"`
+	// UnchangedOpen is that a fix's comment saying nothing should change
+	// stands, no trusted human having commented after it (When.Unchanged;
+	// a read of its own, FactUnchanged).
+	UnchangedOpen bool `json:",omitempty"`
 
 	// PRs.
 	Head      string
@@ -82,7 +86,8 @@ type Item struct {
 	// Runs are the runs of the item's tasks that ended, by rule.
 	Runs []PastRun
 	// Unknown are the facts the scanner has not read (FactConnectedPR,
-	// FactWorkflowCooldown, FactWorkflowDefinition, FactPlan on an issue; FactHistory,
+	// FactWorkflowCooldown, FactWorkflowDefinition, FactPlan, FactUnchanged
+	// on an issue; FactHistory,
 	// FactFeedback, FactChecks on a PR): deciding, a predicate
 	// on one fails and a cooldown it sets holds - nothing is decided on a
 	// fact not read; asking which a decision needs (Set.Needs), they could
@@ -258,6 +263,9 @@ func (w When) holds(r *Rule, it Item, env Env, runs []PastRun) bool {
 	if w.Plan != "" && !it.could(FactPlan) && (it.notRead(FactPlan) || w.Plan != orNone(it.Plan)) {
 		return false
 	}
+	if w.Unchanged != "" && !it.could(FactUnchanged) && (it.notRead(FactUnchanged) || (w.Unchanged == "open") != it.UnchangedOpen) {
+		return false
+	}
 	switch w.Workflow {
 	case "none":
 		if it.Workflow != "" {
@@ -365,6 +373,9 @@ const (
 	// FactPlan is Item.Plan: the issue's comments, its plan comment's
 	// shape.
 	FactPlan = "plan"
+	// FactUnchanged is Item.UnchangedOpen: the issue's comments, a fix's
+	// unchanged comment and any trusted human's after it.
+	FactUnchanged = "unchanged"
 	// FactHistory is what a PR's commits, comments and reviews say:
 	// Item.ReviewedAtHead, ChangesRequested, LastTrustedActivity and the
 	// times a give-up counts from (HeadChangedAt, HumanSpokeAt, PausedAt).

@@ -188,6 +188,13 @@ type When struct {
 	// (open), or not (none). From the issue's body, which the listing
 	// carries: no read of its own.
 	Questions string `yaml:"questions,omitempty" json:"questions,omitempty"` // none | open
+	// Unchanged is whether a fix's word that nothing should change stands:
+	// its comment on the issue (open-pr's, carrying the unchanged marker)
+	// with no trusted human's comment after it (open), or not (none). The
+	// prebaked fix says none, so a fix that changed nothing is not run
+	// again on the issue until someone answers it. A read of its own (the
+	// issue's comments), made only for a rule that asks (Set.Needs).
+	Unchanged string `yaml:"unchanged,omitempty" json:"unchanged,omitempty"` // none | open
 
 	// Pull requests.
 	Checks    string `yaml:"checks,omitempty" json:"checks,omitempty"` // failing | pending | green
@@ -406,7 +413,7 @@ func Parse(data []byte) (*Rule, error) {
 // predicates are the When fields each kind of rule may set, by YAML name.
 var predicates = map[string][]string{
 	"*":     {"any-of", "labels", "assignee", "author", "last-run"},
-	OnIssue: {"linked-pr", "connected-pr", "workflow", "opened-by", "fanout", "graph", "plan", "questions"},
+	OnIssue: {"linked-pr", "connected-pr", "workflow", "opened-by", "fanout", "graph", "plan", "questions", "unchanged"},
 	OnPR:    {"checks", "mergeable", "feedback", "closes", "reviewed-at-head", "changes-requested", "approved", "draft", "inactive-for"},
 }
 
@@ -431,6 +438,7 @@ func (w When) set() []string {
 	add("graph", w.Graph != nil)
 	add("plan", w.Plan != "")
 	add("questions", w.Questions != "")
+	add("unchanged", w.Unchanged != "")
 	add("checks", w.Checks != "")
 	add("mergeable", w.Mergeable != nil)
 	add("feedback", w.Feedback != "")
@@ -451,6 +459,7 @@ var enums = map[string][]string{
 	"connected-pr": {"none", "open"},
 	"plan":         {"none", "pr", "graph", "asking", "replanning"},
 	"questions":    {"none", "open"},
+	"unchanged":    {"none", "open"},
 	"workflow":     {"none", "any", "missing"},
 	"opened-by":    {"watcher"},
 	"checks":       {"failing", "pending", "green"},
@@ -491,7 +500,7 @@ func (w When) validate(on string, nested bool) error {
 	}
 	for field, value := range map[string]string{
 		"assignee": w.Assignee, "linked-pr": w.LinkedPR, "connected-pr": w.ConnectedPR,
-		"workflow": w.Workflow, "opened-by": w.OpenedBy, "plan": w.Plan, "questions": w.Questions,
+		"workflow": w.Workflow, "opened-by": w.OpenedBy, "plan": w.Plan, "questions": w.Questions, "unchanged": w.Unchanged,
 		"checks": w.Checks, "feedback": w.Feedback, "last-run": w.LastRun,
 	} {
 		if err := checkEnum(field, value); err != nil {

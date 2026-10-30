@@ -332,3 +332,39 @@ func TestWorkflowJitter(t *testing.T) {
 		t.Errorf("50 items spread over %s, want at least %s", hi-lo, d/10)
 	}
 }
+
+// A fix's word that nothing should change holds the fix off an issue it
+// would otherwise run on, past its dedupe (the issue updated since) and its
+// cooldown: the unchanged predicate. Not read, the fix is not decided; asked
+// what a decision needs, the fact is.
+func TestDecideUnchangedHoldsFix(t *testing.T) {
+	ranGood := func(it *Item) {
+		// The fix ran and succeeded hours ago; a label since bumped the
+		// issue's updated time.
+		it.Runs = []PastRun{{Rule: "fix", StartedAt: ago(3 * time.Hour), EndedAt: ago(2 * time.Hour)}}
+	}
+	if got := decisions(t, issue(ranGood), testEnv); strings.Join(got, ",") != "fix run" {
+		t.Fatalf("with no unchanged word, decided %v, want fix run", got)
+	}
+	open := issue(func(it *Item) { ranGood(it); it.UnchangedOpen = true })
+	if got := decisions(t, open, testEnv); len(got) != 0 {
+		t.Errorf("with the fix's unchanged word standing, decided %v, want nothing", got)
+	}
+	unread := issue(func(it *Item) { ranGood(it); it.Unknown = []string{FactUnchanged} })
+	if got := decisions(t, unread, testEnv); len(got) != 0 {
+		t.Errorf("with the unchanged fact not read, decided %v, want nothing", got)
+	}
+	set, err := Builtin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if needs := set.Needs(unread, testEnv); len(needs) != 1 || needs[0] != FactUnchanged {
+		t.Errorf("needs %v, want [%s]", needs, FactUnchanged)
+	}
+	// An issue with an open PR closing it needs no read: fix cannot run.
+	linked := unread
+	linked.LinkedPR = "open"
+	if needs := set.Needs(linked, testEnv); len(needs) != 0 {
+		t.Errorf("with a linked PR, needs %v, want none", needs)
+	}
+}

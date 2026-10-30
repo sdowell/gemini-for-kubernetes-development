@@ -852,6 +852,9 @@ func TestOpenPRUnchanged(t *testing.T) {
 	if len(f.issueComments) != 1 || !strings.HasPrefix(f.issueComments[0], "Already fixed by #6 on main") || !strings.Contains(f.issueComments[0], marker(doc)) {
 		t.Errorf("issue comments = %q, want the why once", f.issueComments)
 	}
+	if !IsUnchangedComment(f.issueComments[0]) {
+		t.Errorf("the why carries no unchanged marker: %q", f.issueComments[0])
+	}
 	if doc.Target.URL != issueURL {
 		t.Errorf("target = %s, want the issue still", doc.Target.URL)
 	}
@@ -863,5 +866,14 @@ func TestOpenPRUnchanged(t *testing.T) {
 	}
 	if err := silent.SetPushed(Pushed{Unchanged: true, Base: "b0", Head: "b0"}); err == nil || !strings.Contains(err.Error(), "made no change") {
 		t.Errorf("an unchanged push with no comment: %v", err)
+	}
+}
+
+func TestIsUnchangedComment(t *testing.T) {
+	if !IsUnchangedComment("Already fixed.\n\n" + UnchangedMarker + "\n\n<!-- factory:task-output kind=Change task=fix-2 -->") {
+		t.Error("a comment with the unchanged marker is not one")
+	}
+	if IsUnchangedComment("Why.\n\n<!-- factory:task-output kind=Change task=fix-2 -->") {
+		t.Error("a task-output marker alone reads as unchanged")
 	}
 }

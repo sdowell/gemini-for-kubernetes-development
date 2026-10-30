@@ -432,10 +432,7 @@ func (s *Scanner) queueTask(ctx context.Context, issue *githubv39.Issue, refIssu
 		it.TaskActive = s.queue.HasActiveIssueTask(num)
 		// The facts read only when a rule needs them (Set.Needs), in the
 		// order they cost.
-		it.Unknown = []string{rules.FactConnectedPR, rules.FactPlan}
-		if wf.Name != "" {
-			it.Unknown = []string{rules.FactWorkflowCooldown, rules.FactWorkflowDefinition, rules.FactConnectedPR, rules.FactPlan}
-		}
+		it.Unknown = unknownIssueFacts(issue, wf.Name)
 	})
 
 	// Read what the rules that could decide need, one fact at a time,
@@ -490,6 +487,14 @@ func (s *Scanner) queueTask(ctx context.Context, issue *githubv39.Issue, refIssu
 				return
 			}
 			s.rec.Fill(func(it *rules.Item) { it.Plan = shape })
+		case rules.FactUnchanged:
+			var open bool
+			if open, err = s.readUnchanged(ctx, num); err != nil {
+				s.rec.Gated("reading its comments failed")
+				klog.Errorf("Failed to read whether a fix said nothing should change on issue #%d: %v", num, err)
+				return
+			}
+			s.rec.Fill(func(it *rules.Item) { it.UnchangedOpen = open })
 		}
 		s.rec.Fill(func(it *rules.Item) {
 			it.Unknown = slices.DeleteFunc(it.Unknown, func(f string) bool { return f == needs[0] })
@@ -556,6 +561,34 @@ func (s *Scanner) readPlanShape(ctx context.Context, num int) (string, error) {
 		return "", err
 	}
 	return graph.PlanShape(comments, s.rulesEnv()), nil
+}
+
+// unknownIssueFacts are the facts of an issue read only when a rule needs
+// them (Set.Needs), in the order they cost: a workflow's cooldown and
+// definition when its body names one, then its timeline, its plan, and
+// whether a fix's word that nothing should change stands - not read of an
+// issue with no comments (the listing's count), which has no such word.
+func unknownIssueFacts(issue *githubv39.Issue, workflow string) []string {
+	var out []string
+	if workflow != "" {
+		out = append(out, rules.FactWorkflowCooldown, rules.FactWorkflowDefinition)
+	}
+	out = append(out, rules.FactConnectedPR, rules.FactPlan)
+	if issue.GetComments() > 0 {
+		out = append(out, rules.FactUnchanged)
+	}
+	return out
+}
+
+// readUnchanged reads whether a fix's word that nothing should change
+// stands on the issue, the rules' unchanged fact: its comments, the fix's
+// unchanged comment with no trusted human's after it (unchangedStands).
+func (s *Scanner) readUnchanged(ctx context.Context, num int) (bool, error) {
+	comments, err := s.gh.ListIssueComments(ctx, num)
+	if err != nil {
+		return false, err
+	}
+	return s.unchangedStands(comments), nil
 }
 
 // readConnectedPR reads whether an open PR is connected to the issue on
